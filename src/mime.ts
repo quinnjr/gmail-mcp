@@ -10,7 +10,7 @@ export interface AttachmentInput {
   data?: string;
   /** Defaults to the basename of `path`. */
   filename?: string;
-  /** Guessed from the extension when omitted. */
+  /** Guessed from the extension when omitted. Must be a plain `type/subtype` token. */
   mimeType?: string;
   /** Content-ID for inline images referenced from HTML as cid:... */
   contentId?: string;
@@ -32,6 +32,8 @@ export interface OutgoingMessage {
 }
 
 // ponytail: small extension map; anything else is octet-stream and Gmail sniffs it.
+// Extend inline for types this server actually attaches; swap for the `mime-types`
+// package once the list passes ~40 entries or callers need reverse lookup.
 const MIME_BY_EXT: Record<string, string> = {
   ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
   ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".txt": "text/plain",
@@ -44,17 +46,25 @@ const MIME_BY_EXT: Record<string, string> = {
   ".mp3": "audio/mpeg", ".mp4": "video/mp4", ".ics": "text/calendar",
 };
 
+// RFC 2045 token/token. Anything else (whitespace, CRLF, parameters) is rejected rather
+// than interpolated into a header line.
+const MIME_TOKEN = /^[\w.+-]+\/[\w.+-]+$/;
+
 // Header values go into a raw RFC 822 message; a CR/LF would inject headers.
 const clean = (v: string): string => v.replace(/[\r\n]+/g, " ").trim();
 // RFC 2047 for non-ASCII header text.
 const encodeWord = (v: string): string =>
   /^[\x20-\x7E]*$/.test(v) ? v : `=?UTF-8?B?${Buffer.from(v, "utf8").toString("base64")}?=`;
 // RFC 2045: 76-char lines.
-const b64Lines = (buf: Buffer): string => buf.toString("base64").replace(/(.{76})(?=.)/g, "$1\r\n");
-const asciiName = (name: string): string => clean(name).replace(/["\\]/g, "_");
+export const b64Lines = (buf: Buffer): string =>
+  buf.toString("base64").replace(/(.{76})(?=.)/g, "$1\r\n");
+// A filename sits inside a quoted header parameter: no CRLF, quotes, or backslashes.
+const quotedName = (name: string): string => clean(name).replace(/["\\]/g, "_");
+// The 7-bit form old clients read; the real name travels in RFC 2231 `filename*`.
+const asciiName = (name: string): string => quotedName(name).replace(/[^\x20-\x7E]/g, "_");
 const filenameParams = (name: string): string => {
-  const safe = asciiName(name);
-  const ascii = safe.replace(/[^\x20-\x7E]/g, "_");
+  const safe = quotedName(name);
+  const ascii = asciiName(name);
   return ascii === safe
     ? `filename="${ascii}"`
     : `filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(safe)}`;
@@ -62,6 +72,9 @@ const filenameParams = (name: string): string => {
 
 const loadAttachment = async (a: AttachmentInput) => {
   if (!a.path && !a.data) throw new Error("attachment needs `path` or `data`");
+  if (a.mimeType && !MIME_TOKEN.test(a.mimeType)) {
+    throw new Error(`attachment mimeType ${JSON.stringify(a.mimeType)} is not a type/subtype token`);
+  }
   const data = a.path ? await fs.readFile(a.path) : Buffer.from(a.data!, "base64");
   const filename = a.filename ?? (a.path ? path.basename(a.path) : "attachment");
   const mimeType =
@@ -123,7 +136,7 @@ export const buildRaw = async (m: OutgoingMessage): Promise<string> => {
   for (const a of attachments) {
     parts.push(
       `--${mixed}`,
-      `Content-Type: ${a.mimeType}; name="${asciiName(a.filename).replace(/[^\x20-\x7E]/g, "_")}"`,
+      `Content-Type: ${a.mimeType}; name="${asciiName(a.filename)}"`,
       `Content-Disposition: ${a.contentId ? "inline" : "attachment"}; ${filenameParams(a.filename)}`,
       "Content-Transfer-Encoding: base64",
       ...(a.contentId ? [`Content-ID: <${clean(a.contentId)}>`] : []),
@@ -172,20 +185,25 @@ export interface ParsedMessage {
   /** Full HTML body, every text/html part concatenated. Never truncated. */
   html?: string;
   attachments: ParsedAttachment[];
+  /** Charsets that TextDecoder rejected; those parts were decoded as UTF-8 and may be garbled. */
+  decodeWarnings?: string[];
 }
 
-const decode = (data: string, charset?: string): string => {
+const decode = (data: string, charset: string | undefined, warnings: string[]): string => {
   const buf = Buffer.from(data, "base64url");
   try {
     return new TextDecoder(charset || "utf-8").decode(buf);
   } catch {
+    warnings.push(`unsupported charset ${JSON.stringify(charset)}; decoded as UTF-8`);
     return buf.toString("utf8");
   }
 };
 
+const header = (part: gmail_v1.Schema$MessagePart, name: string): string | undefined =>
+  part.headers?.find((h) => h.name?.toLowerCase() === name)?.value ?? undefined;
+
 const charsetOf = (part: gmail_v1.Schema$MessagePart): string | undefined =>
-  part.headers?.find((h) => h.name?.toLowerCase() === "content-type")?.value
-    ?.match(/charset="?([^";\s]+)"?/i)?.[1];
+  header(part, "content-type")?.match(/charset="?([^";\s]+)"?/i)?.[1];
 
 /** Flatten a Gmail `format: full` message into headers, complete bodies, and attachments. */
 export const parseMessage = (msg: gmail_v1.Schema$Message): ParsedMessage => {
@@ -197,14 +215,21 @@ export const parseMessage = (msg: gmail_v1.Schema$Message): ParsedMessage => {
   const texts: string[] = [];
   const htmls: string[] = [];
   const attachments: ParsedAttachment[] = [];
+  const decodeWarnings: string[] = [];
   // Iterative walk: nesting depth comes from inbound mail, not from us.
   const stack: gmail_v1.Schema$MessagePart[] = msg.payload ? [msg.payload] : [];
   while (stack.length) {
     const part = stack.pop()!;
     const mime = (part.mimeType ?? "").toLowerCase();
     const data = part.body?.data ?? undefined;
-    const disposition = part.headers?.find((h) => h.name?.toLowerCase() === "content-disposition")?.value ?? "";
-    const isAttachment = Boolean(part.filename) || /^attachment/i.test(disposition) || Boolean(part.body?.attachmentId);
+    const isText = mime === "" || mime === "text/plain" || mime === "text/html";
+    // A part with bytes that is not body text is an attachment even when the sender
+    // gave it no filename (PGP signatures, unnamed inline images).
+    const isAttachment =
+      Boolean(part.filename) ||
+      /^attachment/i.test(header(part, "content-disposition") ?? "") ||
+      Boolean(part.body?.attachmentId) ||
+      (Boolean(data) && !isText && mime !== "message/rfc822");
     if (isAttachment) {
       attachments.push({
         partId: part.partId ?? undefined,
@@ -212,12 +237,11 @@ export const parseMessage = (msg: gmail_v1.Schema$Message): ParsedMessage => {
         mimeType: part.mimeType || "application/octet-stream",
         size: part.body?.size ?? 0,
         attachmentId: part.body?.attachmentId ?? undefined,
-        contentId: part.headers?.find((h) => h.name?.toLowerCase() === "content-id")?.value?.replace(/^<|>$/g, ""),
+        contentId: header(part, "content-id")?.replace(/^<|>$/g, ""),
         data: part.body?.attachmentId ? undefined : (data && Buffer.from(data, "base64url").toString("base64")),
       });
     } else if (data && mime !== "message/rfc822") {
-      if (mime === "text/html") htmls.push(decode(data, charsetOf(part)));
-      else if (!mime || mime.startsWith("text/")) texts.push(decode(data, charsetOf(part)));
+      (mime === "text/html" ? htmls : texts).push(decode(data, charsetOf(part), decodeWarnings));
     }
     const children = part.parts ?? [];
     for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
@@ -244,5 +268,6 @@ export const parseMessage = (msg: gmail_v1.Schema$Message): ParsedMessage => {
     text: texts.length ? texts.join("\n") : undefined,
     html: htmls.length ? htmls.join("\n") : undefined,
     attachments,
+    decodeWarnings: decodeWarnings.length ? decodeWarnings : undefined,
   };
 };
