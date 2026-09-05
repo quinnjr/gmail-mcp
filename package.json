@@ -1,0 +1,32 @@
+{
+  "name": "@quinnjr/gmail-mcp",
+  "version": "0.1.0",
+  "description": "Streamable HTTP MCP server covering the full Gmail API v1 surface",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": { "gmail-mcp": "dist/index.js" },
+  "files": ["dist/**/*.js", "dist/**/*.d.ts", "!dist/__tests__/**"],
+  "scripts": {
+    "build": "rm -rf dist && tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "auth": "tsx src/index.ts auth",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "author": "Joseph R. Quinn",
+  "license": "MIT",
+  "packageManager": "pnpm@11.24.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "googleapis": "^176.0.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  },
+  "engines": { "node": ">=20.19.0" }
+}
