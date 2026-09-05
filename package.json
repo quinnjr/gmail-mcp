@@ -4,8 +4,26 @@
   "description": "Streamable HTTP MCP server covering the full Gmail API v1 surface",
   "type": "module",
   "main": "dist/index.js",
-  "bin": { "gmail-mcp": "dist/index.js" },
-  "files": ["dist/**/*.js", "dist/**/*.d.ts", "!dist/__tests__/**"],
+  "bin": {
+    "gmail-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "!dist/__tests__/**"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/quinnjr/gmail-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/quinnjr/gmail-mcp/issues"
+  },
+  "homepage": "https://github.com/quinnjr/gmail-mcp#readme",
   "scripts": {
     "build": "rm -rf dist && tsc",
     "dev": "tsx watch src/index.ts",
@@ -28,5 +46,7 @@
     "typescript": "^6.0.3",
     "vitest": "^4.1.11"
   },
-  "engines": { "node": ">=20.19.0" }
+  "engines": {
+    "node": ">=20.19.0"
+  }
 }
