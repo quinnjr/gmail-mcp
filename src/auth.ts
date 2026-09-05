@@ -74,8 +74,27 @@ export const loadTokens = async (
   return false;
 };
 
+export interface AuthorizeOptions {
+  /** Hand the consent URL to the user. Defaults to xdg-open plus a stderr print. */
+  open?: (url: string) => void;
+  /** Exchange the callback code for tokens. Defaults to the OAuth client's getToken. */
+  exchange?: (client: Auth.OAuth2Client, code: string) => Promise<Auth.Credentials>;
+  timeoutMs?: number;
+}
+
+const openInBrowser = (url: string): void => {
+  console.error(`Open this URL to authorize gmail-mcp:\n\n${url}\n`);
+  spawn("xdg-open", [url], { stdio: "ignore", detached: true })
+    .on("error", () => console.error("Could not open a browser automatically; open the URL above by hand."))
+    .unref();
+};
+
 /** Interactive browser consent for the full scope set; writes TOKEN_PATH. */
-export const authorize = async (): Promise<void> => {
+export const authorize = async ({
+  open = openInBrowser,
+  exchange = async (client, code) => (await client.getToken(code)).tokens,
+  timeoutMs = AUTH_TIMEOUT_MS,
+}: AuthorizeOptions = {}): Promise<void> => {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as { port: number };
@@ -87,8 +106,8 @@ export const authorize = async (): Promise<void> => {
   try {
     const code = await new Promise<string>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error(`No OAuth callback within ${AUTH_TIMEOUT_MS / 60_000} minutes; run \`gmail-mcp auth\` again`)),
-        AUTH_TIMEOUT_MS
+        () => reject(new Error(`No OAuth callback within ${timeoutMs / 60_000} minutes; run \`gmail-mcp auth\` again`)),
+        timeoutMs
       );
       server.on("request", (req, res) => {
         const u = new URL(req.url ?? "/", redirectUri);
@@ -112,13 +131,9 @@ export const authorize = async (): Promise<void> => {
           reject(new Error(`OAuth error: ${error}`));
         }
       });
-      console.error(`Open this URL to authorize gmail-mcp:\n\n${url}\n`);
-      spawn("xdg-open", [url], { stdio: "ignore", detached: true })
-        .on("error", () => console.error("Could not open a browser automatically; open the URL above by hand."))
-        .unref();
+      open(url);
     });
-    const { tokens } = await client.getToken(code);
-    await saveTokens(tokens);
+    await saveTokens(await exchange(client, code));
     console.error(`Tokens saved to ${TOKEN_PATH}`);
   } finally {
     server.close();

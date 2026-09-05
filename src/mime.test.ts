@@ -50,6 +50,24 @@ describe("buildRaw", () => {
     expect(raw).toContain("Content-ID: <logo>\r\n");
   });
 
+  it("nests related (body + cid parts) inside mixed when both kinds of attachment are present", async () => {
+    const raw = await decodeRaw({
+      html: '<img src="cid:logo">',
+      attachments: [
+        { data: b64u("PNG"), filename: "logo.png", contentId: "logo" },
+        { data: b64u("PDF"), filename: "doc.pdf" },
+      ],
+    });
+    const mixedAt = raw.indexOf("Content-Type: multipart/mixed;");
+    const relatedAt = raw.indexOf("Content-Type: multipart/related;");
+    const pdfAt = raw.indexOf('name="doc.pdf"');
+    const relatedEnd = raw.indexOf(`--${raw.match(/multipart\/related; boundary="([^"]+)"/)![1]}--`);
+    expect(mixedAt).toBeGreaterThan(-1);
+    expect(relatedAt).toBeGreaterThan(mixedAt);
+    expect(raw.indexOf("Content-ID: <logo>")).toBeLessThan(relatedEnd);
+    expect(pdfAt).toBeGreaterThan(relatedEnd);
+  });
+
   it("emits an ASCII filename plus RFC 2231 filename* for non-ASCII names", async () => {
     const raw = await decodeRaw({ text: "x", attachments: [{ data: "AA==", filename: "résumé.pdf" }] });
     expect(raw).toContain('name="r_sum_.pdf"');
@@ -112,6 +130,21 @@ describe("parseMessage", () => {
     expect(parsed.attachments).toEqual([
       expect.objectContaining({ filename: "attachment", mimeType: "application/pgp-signature", data: b64u("SIG").replace(/-/g, "+") }),
     ]);
+  });
+
+  it("keeps an inline message/rfc822 part as a .eml attachment", () => {
+    const parsed = parseMessage({
+      id: "4",
+      payload: {
+        mimeType: "multipart/mixed",
+        parts: [
+          { mimeType: "text/plain", body: { data: b64u("fwd") } },
+          { mimeType: "message/rfc822", body: { data: b64u("Subject: inner\r\n\r\nbody"), size: 22 } },
+        ],
+      },
+    });
+    expect(parsed.text).toBe("fwd");
+    expect(parsed.attachments).toEqual([expect.objectContaining({ filename: "message.eml", mimeType: "message/rfc822" })]);
   });
 
   it("honours the part charset and flags charsets TextDecoder rejects", () => {

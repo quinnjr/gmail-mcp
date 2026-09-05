@@ -123,29 +123,34 @@ export const buildRaw = async (m: OutgoingMessage): Promise<string> => {
   }
 
   const attachments = await Promise.all((m.attachments ?? []).map(loadAttachment));
-  if (attachments.length === 0) return toBase64Url([...headers, body].join("\r\n"));
+  const inline = attachments.filter((a) => a.contentId);
+  const plain = attachments.filter((a) => !a.contentId);
+  // RFC 2046 nesting: related wraps the body and its cid: parts; mixed wraps that plus files.
+  if (inline.length) body = multipart("related", [body, ...inline.map(attachmentPart)]);
+  if (plain.length) body = multipart("mixed", [body, ...plain.map(attachmentPart)]);
+  return toBase64Url([...headers, body].join("\r\n"));
+};
 
-  const mixed = `----=_mixed_${randomUUID()}`;
-  const parts = [
-    ...headers,
-    `Content-Type: multipart/${attachments.some((a) => a.contentId) ? "related" : "mixed"}; boundary="${mixed}"`,
+type LoadedAttachment = Awaited<ReturnType<typeof loadAttachment>>;
+
+const attachmentPart = (a: LoadedAttachment): string =>
+  [
+    `Content-Type: ${a.mimeType}; name="${asciiName(a.filename)}"`,
+    `Content-Disposition: ${a.contentId ? "inline" : "attachment"}; ${filenameParams(a.filename)}`,
+    "Content-Transfer-Encoding: base64",
+    ...(a.contentId ? [`Content-ID: <${clean(a.contentId)}>`] : []),
     "",
-    `--${mixed}`,
-    body,
-  ];
-  for (const a of attachments) {
-    parts.push(
-      `--${mixed}`,
-      `Content-Type: ${a.mimeType}; name="${asciiName(a.filename)}"`,
-      `Content-Disposition: ${a.contentId ? "inline" : "attachment"}; ${filenameParams(a.filename)}`,
-      "Content-Transfer-Encoding: base64",
-      ...(a.contentId ? [`Content-ID: <${clean(a.contentId)}>`] : []),
-      "",
-      b64Lines(a.data)
-    );
-  }
-  parts.push(`--${mixed}--`);
-  return toBase64Url(parts.join("\r\n"));
+    b64Lines(a.data),
+  ].join("\r\n");
+
+const multipart = (subtype: "mixed" | "related", parts: string[]): string => {
+  const boundary = `----=_${subtype}_${randomUUID()}`;
+  return [
+    `Content-Type: multipart/${subtype}; boundary="${boundary}"`,
+    "",
+    ...parts.flatMap((p) => [`--${boundary}`, p]),
+    `--${boundary}--`,
+  ].join("\r\n");
 };
 
 const toBase64Url = (s: string): string => Buffer.from(s, "utf8").toString("base64url");
@@ -170,6 +175,7 @@ export interface ParsedMessage {
   historyId?: string;
   internalDate?: string;
   sizeEstimate?: number;
+  /** Top-level headers by name. Repeated names (Received, X-*) keep the last value. */
   headers: Record<string, string>;
   subject?: string;
   from?: string;
@@ -224,23 +230,23 @@ export const parseMessage = (msg: gmail_v1.Schema$Message): ParsedMessage => {
     const data = part.body?.data ?? undefined;
     const isText = mime === "" || mime === "text/plain" || mime === "text/html";
     // A part with bytes that is not body text is an attachment even when the sender
-    // gave it no filename (PGP signatures, unnamed inline images).
+    // gave it no filename (PGP signatures, unnamed inline images, inline .eml).
     const isAttachment =
       Boolean(part.filename) ||
       /^attachment/i.test(header(part, "content-disposition") ?? "") ||
       Boolean(part.body?.attachmentId) ||
-      (Boolean(data) && !isText && mime !== "message/rfc822");
+      (Boolean(data) && !isText);
     if (isAttachment) {
       attachments.push({
         partId: part.partId ?? undefined,
-        filename: part.filename || "attachment",
+        filename: part.filename || (mime === "message/rfc822" ? "message.eml" : "attachment"),
         mimeType: part.mimeType || "application/octet-stream",
         size: part.body?.size ?? 0,
         attachmentId: part.body?.attachmentId ?? undefined,
         contentId: header(part, "content-id")?.replace(/^<|>$/g, ""),
         data: part.body?.attachmentId ? undefined : (data && Buffer.from(data, "base64url").toString("base64")),
       });
-    } else if (data && mime !== "message/rfc822") {
+    } else if (data) {
       (mime === "text/html" ? htmls : texts).push(decode(data, charsetOf(part), decodeWarnings));
     }
     const children = part.parts ?? [];
