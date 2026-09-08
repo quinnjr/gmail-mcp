@@ -28,6 +28,8 @@ export interface HandlerOptions {
   host: string;
   port: number;
   sessions?: Map<string, Session>;
+  /** Looks up the current token for an email; defaults to the in-memory `accounts` entry. */
+  tokenFor?: (email: string) => Promise<string | undefined>;
 }
 
 const digest = (v: string): Buffer => createHash("sha256").update(v).digest();
@@ -35,14 +37,20 @@ const digest = (v: string): Buffer => createHash("sha256").update(v).digest();
 /**
  * The email owning the bearer token in `header`, or undefined. Hashing both sides keeps the
  * comparison constant time (timingSafeEqual needs equal lengths) and hides token length.
+ * Tokens are resolved via `tokenFor` on every call so a rotated token takes effect immediately.
  */
-export const authenticate = (header: string | undefined, accounts: HandlerOptions["accounts"]): string | undefined => {
+export const authenticate = async (
+  header: string | undefined,
+  emails: Iterable<string>,
+  tokenFor: (email: string) => Promise<string | undefined>
+): Promise<string | undefined> => {
   const match = /^Bearer (\S+)$/i.exec(header ?? "");
   if (!match) return undefined;
   const candidate = digest(match[1]);
   let found: string | undefined;
-  for (const [email, account] of accounts) {
-    if (timingSafeEqual(candidate, digest(account.token))) found = email;
+  for (const email of emails) {
+    const token = await tokenFor(email);
+    if (token && timingSafeEqual(candidate, digest(token))) found = email;
   }
   return found;
 };
@@ -57,7 +65,13 @@ const rpcError = (res: ServerResponse, status: number, message: string, headers:
  * Streamable HTTP only, at /mcp. One McpServer per session (the SDK requires 1:1
  * server/transport). Exported so the routing can be exercised without a socket.
  */
-export const createRequestHandler = ({ accounts, host, port, sessions = new Map() }: HandlerOptions) => {
+export const createRequestHandler = ({
+  accounts,
+  host,
+  port,
+  sessions = new Map(),
+  tokenFor = async (email) => accounts.get(email)?.token,
+}: HandlerOptions) => {
   // The SDK compares the raw Host header, so list each name with and without the port.
   // Anything else is a DNS-rebinding attempt.
   const allowedHosts = [...new Set([host, "127.0.0.1", "localhost", "[::1]"])].flatMap((h) => [h, `${h}:${port}`]);
@@ -72,7 +86,7 @@ export const createRequestHandler = ({ accounts, host, port, sessions = new Map(
       // Authenticate before the session lookup so an unauthenticated probe cannot tell a live
       // session id from a dead one.
       const auth = req.headers.authorization;
-      const email = authenticate(Array.isArray(auth) ? auth[0] : auth, accounts);
+      const email = await authenticate(Array.isArray(auth) ? auth[0] : auth, accounts.keys(), tokenFor);
       if (!email) {
         rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
         return;
@@ -183,7 +197,7 @@ const main = async (): Promise<void> => {
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
-  const { handler, sweep } = createRequestHandler({ accounts, host, port });
+  const { handler, sweep } = createRequestHandler({ accounts, host, port, tokenFor: readAccountToken });
   setInterval(sweep, SESSION_IDLE_MS / 4).unref();
   createServer(handler).listen(port, host, () =>
     console.error(`gmail-mcp ${version} listening on http://${host}:${port}/mcp`)

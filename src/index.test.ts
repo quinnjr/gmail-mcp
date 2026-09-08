@@ -48,20 +48,22 @@ const rpc = async (token: string, sid: string, body: unknown): Promise<string> =
   return res.text();
 };
 
+const tokenFor = async (email: string) => accounts.get(email)?.token;
+
 describe("authenticate", () => {
-  it("returns undefined without a header, with a wrong scheme, or with a wrong token", () => {
-    expect(authenticate(undefined, accounts)).toBeUndefined();
-    expect(authenticate("", accounts)).toBeUndefined();
-    expect(authenticate(`Basic ${AMY}`, accounts)).toBeUndefined();
-    expect(authenticate(AMY, accounts)).toBeUndefined();
-    expect(authenticate("Bearer nope", accounts)).toBeUndefined();
-    expect(authenticate(`Bearer  ${AMY}`, accounts)).toBeUndefined(); // two spaces is not the scheme grammar
+  it("returns undefined without a header, with a wrong scheme, or with a wrong token", async () => {
+    expect(await authenticate(undefined, accounts.keys(), tokenFor)).toBeUndefined();
+    expect(await authenticate("", accounts.keys(), tokenFor)).toBeUndefined();
+    expect(await authenticate(`Basic ${AMY}`, accounts.keys(), tokenFor)).toBeUndefined();
+    expect(await authenticate(AMY, accounts.keys(), tokenFor)).toBeUndefined();
+    expect(await authenticate("Bearer nope", accounts.keys(), tokenFor)).toBeUndefined();
+    expect(await authenticate(`Bearer  ${AMY}`, accounts.keys(), tokenFor)).toBeUndefined(); // two spaces is not the scheme grammar
   });
 
-  it("returns the email owning the token, with a case-insensitive scheme", () => {
-    expect(authenticate(`Bearer ${AMY}`, accounts)).toBe("amy@example.com");
-    expect(authenticate(`bearer ${BOB}`, accounts)).toBe("bob@example.com");
-    expect(authenticate(`BEARER ${BOB}`, accounts)).toBe("bob@example.com");
+  it("returns the email owning the token, with a case-insensitive scheme", async () => {
+    expect(await authenticate(`Bearer ${AMY}`, accounts.keys(), tokenFor)).toBe("amy@example.com");
+    expect(await authenticate(`bearer ${BOB}`, accounts.keys(), tokenFor)).toBe("bob@example.com");
+    expect(await authenticate(`BEARER ${BOB}`, accounts.keys(), tokenFor)).toBe("bob@example.com");
   });
 });
 
@@ -128,5 +130,42 @@ describe("request routing", () => {
     const text = await rpc(BOB, sid, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "gmail_list_accounts", arguments: {} } });
     expect(text).toContain("bob@example.com");
     expect(text).not.toContain("amy@example.com");
+  });
+
+  it("invalidates the old token and accepts the new one immediately on rotation, with no restart", async () => {
+    const tokens = new Map<string, string>([["amy@example.com", AMY], ["bob@example.com", BOB]]);
+    const server = createServer();
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const { handler } = createRequestHandler({
+      accounts, host: "127.0.0.1", port,
+      tokenFor: async (email) => tokens.get(email),
+    });
+    server.on("request", handler);
+    const rotBase = `http://127.0.0.1:${port}`;
+    try {
+      const openRotSession = async (token: string): Promise<string> => {
+        const res = await fetch(`${rotBase}/mcp`, { method: "POST", headers: as(token), body: JSON.stringify(initialize) });
+        expect(res.status).toBe(200);
+        await res.text();
+        const sid = res.headers.get("mcp-session-id")!;
+        await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
+        return sid;
+      };
+      const sid = await openRotSession(AMY);
+
+      const NEW_AMY = "amy-token-rotated";
+      tokens.set("amy@example.com", NEW_AMY);
+
+      const listTools = { jsonrpc: "2.0", id: 4, method: "tools/list", params: {} };
+      const stale = await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(AMY), "mcp-session-id": sid }, body: JSON.stringify(listTools) });
+      expect(stale.status).toBe(401);
+
+      const fresh = await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(NEW_AMY), "mcp-session-id": sid }, body: JSON.stringify(listTools) });
+      expect(fresh.status).toBe(200);
+    } finally {
+      server.close();
+    }
   });
 });
