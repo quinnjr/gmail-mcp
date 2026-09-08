@@ -11,7 +11,11 @@ beforeAll(async () => {
   const server = createServer();
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as AddressInfo).port;
-  const { handler } = createRequestHandler({ gmail: { users: { settings: {} } } as unknown as gmail_v1.Gmail, host: "127.0.0.1", port });
+  const gmail = { users: { settings: {} } } as unknown as gmail_v1.Gmail;
+  const { handler } = createRequestHandler({
+    accounts: { clients: new Map([["amy@example.com", gmail]]), default: "amy@example.com" },
+    host: "127.0.0.1", port,
+  });
   server.on("request", handler);
   base = `http://127.0.0.1:${port}`;
   close = () => server.close();
@@ -49,5 +53,14 @@ describe("request routing", () => {
       req.end(JSON.stringify(initialize));
     });
     expect(status).toBe(403);
+  });
+
+  it("lists gmail_list_accounts through a session", async () => {
+    const init = await fetch(`${base}/mcp`, { method: "POST", headers, body: JSON.stringify(initialize) });
+    const sid = init.headers.get("mcp-session-id")!;
+    const res = await fetch(`${base}/mcp`, { method: "POST", headers: { ...headers, "mcp-session-id": sid },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) });
+    const text = await res.text();
+    expect(text).toContain("gmail_list_accounts");
   });
 });

@@ -5,9 +5,8 @@ import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { google, type gmail_v1 } from "googleapis";
-import { authorize, createClient, loadTokens, TOKEN_PATH } from "./auth.js";
-import { registerTools } from "./tools.js";
+import { authorize, listAccounts, loadAccounts, readDefault, removeAccount, writeDefault } from "./auth.js";
+import { registerTools, type Accounts } from "./tools.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
 
@@ -20,7 +19,7 @@ interface Session {
 }
 
 export interface HandlerOptions {
-  gmail: gmail_v1.Gmail;
+  accounts: Accounts;
   host: string;
   port: number;
   sessions?: Map<string, Session>;
@@ -30,7 +29,7 @@ export interface HandlerOptions {
  * Streamable HTTP only, at /mcp. One McpServer per session (the SDK requires 1:1
  * server/transport). Exported so the routing can be exercised without a socket.
  */
-export const createRequestHandler = ({ gmail, host, port, sessions = new Map() }: HandlerOptions) => {
+export const createRequestHandler = ({ accounts, host, port, sessions = new Map() }: HandlerOptions) => {
   // The SDK compares the raw Host header, so list each name with and without the port.
   // Anything else is a DNS-rebinding attempt.
   const allowedHosts = [...new Set([host, "127.0.0.1", "localhost", "[::1]"])].flatMap((h) => [h, `${h}:${port}`]);
@@ -69,7 +68,7 @@ export const createRequestHandler = ({ gmail, host, port, sessions = new Map() }
       });
       transport.onclose = () => transport.sessionId && sessions.delete(transport.sessionId);
       const server = new McpServer({ name: "gmail-mcp", version });
-      registerTools(server, gmail);
+      registerTools(server, accounts);
       await server.connect(transport);
       await transport.handleRequest(req, res);
     } catch (err) {
@@ -94,22 +93,50 @@ export const createRequestHandler = ({ gmail, host, port, sessions = new Map() }
 
 // All diagnostics go to stderr on purpose: stdout stays quiet so a process manager
 // or shell pipeline never mistakes status lines for output.
-const main = async (): Promise<void> => {
-  if (process.argv[2] === "auth") {
-    await authorize();
-    return;
+const cli = async (argv: string[]): Promise<boolean> => {
+  const [cmd, flag, value] = argv;
+  const known = async () => (await listAccounts()).join(", ") || "none";
+  if (cmd === "accounts") {
+    const def = await readDefault();
+    const all = await listAccounts();
+    if (all.length === 0) console.error("No accounts. Run: gmail-mcp auth");
+    for (const e of all) console.error(`${e === def ? "*" : " "} ${e}`);
+    return true;
   }
+  if (cmd !== "auth") return false;
+  if (flag === "--default") {
+    if (!value) throw new Error("Usage: gmail-mcp auth --default <email>");
+    const email = value.toLowerCase();
+    if (!(await listAccounts()).includes(email)) throw new Error(`Unknown account "${email}". Signed-in accounts: ${await known()}`);
+    await writeDefault(email);
+    console.error(`Default account: ${email}`);
+    return true;
+  }
+  if (flag === "--remove") {
+    if (!value) throw new Error("Usage: gmail-mcp auth --remove <email>");
+    await removeAccount(value);
+    console.error(`Removed ${value.toLowerCase()}. Signed-in accounts: ${await known()}`);
+    return true;
+  }
+  if (flag) throw new Error(`Unknown option ${flag}. Usage: gmail-mcp auth [--default <email> | --remove <email>]`);
+  await authorize();
+  return true;
+};
 
-  const auth = await createClient();
-  if (!(await loadTokens(auth))) {
-    console.error(`No tokens at ${TOKEN_PATH}. Run: gmail-mcp auth`);
+const main = async (): Promise<void> => {
+  if (await cli(process.argv.slice(2))) return;
+
+  const loaded = await loadAccounts();
+  if (!loaded) {
+    console.error("No accounts. Run: gmail-mcp auth");
     process.exit(1);
   }
-  const gmail = google.gmail({ version: "v1", auth });
+  const accounts: Accounts = { ...loaded, setDefault: writeDefault };
+  console.error(`gmail-mcp accounts: ${[...accounts.clients.keys()].join(", ")} (default ${accounts.default})`);
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
-  const { handler, sweep } = createRequestHandler({ gmail, host, port });
+  const { handler, sweep } = createRequestHandler({ accounts, host, port });
   setInterval(sweep, SESSION_IDLE_MS / 4).unref();
   createServer(handler).listen(port, host, () =>
     console.error(`gmail-mcp ${version} listening on http://${host}:${port}/mcp`)
