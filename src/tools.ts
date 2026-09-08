@@ -12,9 +12,8 @@ type Gmail = gmail_v1.Gmail;
 
 export interface Accounts {
   clients: Map<string, Gmail>;
+  /** The account this session's bearer token is bound to; used when `account` is omitted. */
   default: string;
-  /** Persist a new default. Called by gmail_set_default_account after validation. */
-  setDefault: (email: string) => Promise<void>;
 }
 
 const json = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v ?? {}, null, 2) }] });
@@ -44,7 +43,7 @@ const caller = (account: string): Call => async (fn) => {
 
 const ids = {
   userId: z.string().default("me").describe("Mailbox; 'me' is the authenticated user"),
-  account: z.string().optional().describe("Signed-in Gmail address to act as. Omit for the default account."),
+  account: z.string().optional().describe("Signed-in Gmail address to act as. Omit for this token's account."),
 };
 const body = z.record(z.string(), z.unknown());
 const attachment = z.object({
@@ -115,18 +114,9 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     }) as unknown as ToolCallback<S>);
 
   // ---- accounts ----
-  server.registerTool("gmail_list_accounts", { description: "Signed-in Gmail accounts and which one is the default", inputSchema: {} },
+  server.registerTool("gmail_list_accounts",
+    { description: "Gmail accounts this bearer token can act as, and the one used when `account` is omitted", inputSchema: {} },
     () => json({ accounts: known(), default: accounts.default }));
-  server.registerTool("gmail_set_default_account",
-    { description: "Change which signed-in account tools use when `account` is omitted (server-wide, persisted)",
-      inputSchema: { account: z.string().min(1) } },
-    async ({ account }) => {
-      const email = normalizeEmail(account);
-      if (!accounts.clients.has(email)) throw unknownAccountError(email, known());
-      await accounts.setDefault(email);
-      accounts.default = email;
-      return json({ default: email });
-    });
 
   // ---- users ----
   tool("gmail_get_profile", "Mailbox profile: email, message/thread totals, historyId", ids,

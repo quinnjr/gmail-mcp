@@ -58,17 +58,16 @@ const invoke = async (t: Registered, args: Record<string, unknown>) =>
 describe("registerTools", () => {
   const amy = recordingGmail();
   const bob = recordingGmail();
-  const setDefaults: string[] = [];
   const accounts: Accounts = {
     clients: new Map([["amy@example.com", amy.gmail], ["bob@example.com", bob.gmail]]),
     default: "amy@example.com",
-    setDefault: async (e) => void setDefaults.push(e),
   };
   const tools = collect(accounts);
-  const accountTools = new Set(["gmail_list_accounts", "gmail_set_default_account"]);
+  const accountTools = new Set(["gmail_list_accounts"]);
 
-  it("registers all 80 users.* endpoints plus 2 account tools", () => {
-    expect(tools.size).toBe(82);
+  it("registers all 80 users.* endpoints plus 1 account tool", () => {
+    expect(tools.size).toBe(81);
+    expect(tools.has("gmail_set_default_account")).toBe(false);
   });
 
   it("every tool reaches exactly one googleapis method with its required input and returns JSON text", async () => {
@@ -144,33 +143,14 @@ describe("registerTools", () => {
     expect(JSON.parse((r.content[0] as { text: string }).text)).toEqual({ size: 5, data: Buffer.from("bytes").toString("base64") });
   });
 
-  it("gmail_list_accounts and gmail_set_default_account", async () => {
+  it("gmail_list_accounts reports the signed-in accounts and the bound one", async () => {
     const list = await invoke(tools.get("gmail_list_accounts")!, {});
     expect(JSON.parse((list.content[0] as { text: string }).text)).toEqual({ accounts: ["amy@example.com", "bob@example.com"], default: "amy@example.com" });
-
-    await invoke(tools.get("gmail_set_default_account")!, { account: "bob@example.com" });
-    expect(accounts.default).toBe("bob@example.com");
-    expect(setDefaults).toEqual(["bob@example.com"]);
-    bob.calls.length = 0;
-    await invoke(tools.get("gmail_get_profile")!, {});
-    expect(bob.calls.length).toBe(1);
-
-    await expect(invoke(tools.get("gmail_set_default_account")!, { account: "nope@example.com" })).rejects.toThrow(/Unknown account/);
-  });
-
-  it("gmail_set_default_account rejects a blank account at the schema level", async () => {
-    const t = tools.get("gmail_set_default_account")!;
-    expect(() => z.object(t.shape).parse({ account: "" })).toThrow();
-  });
-
-  it("gmail_set_default_account rejects a whitespace-only account as unknown once normalized", async () => {
-    const t = tools.get("gmail_set_default_account")!;
-    await expect(invoke(t, { account: "  " })).rejects.toThrow(/Unknown account ""/);
   });
 
   it("wraps Google auth errors with the account and the command that fixes them", async () => {
     const failing = { users: { getProfile: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })), settings: {} } } as unknown as gmail_v1.Gmail;
-    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", setDefault: async () => {} }).get("gmail_get_profile")!;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_profile")!;
     await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
   });
 
@@ -178,7 +158,7 @@ describe("registerTools", () => {
     const failing = {
       users: { getProfile: () => Promise.reject(Object.assign(new Error("insufficient scope"), { code: 403 })), settings: {} },
     } as unknown as gmail_v1.Gmail;
-    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", setDefault: async () => {} }).get("gmail_get_profile")!;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_profile")!;
     // explain()'s 403-scope message puts the raw Google error last, after the `gmail-mcp auth` fix
     // instruction, so this checks the account + fix + raw error text in the order they actually appear.
     await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth.*insufficient scope/);
@@ -188,7 +168,7 @@ describe("registerTools", () => {
     const failing = {
       users: { messages: { get: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })) }, settings: {} },
     } as unknown as gmail_v1.Gmail;
-    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", setDefault: async () => {} }).get("gmail_get_message")!;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_message")!;
     await expect(invoke(t, { id: "m" })).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
   });
 });
