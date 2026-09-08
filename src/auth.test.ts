@@ -28,49 +28,52 @@ describe("loadAccounts", () => {
     expect(await a.loadAccounts({ legacyPaths: [path.join(dir, "missing.json")], gmailFor })).toBeUndefined();
   });
 
-  it("builds one client per account and honours the default file", async () => {
+  it("builds one client per account, each with its bearer token", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const a = await freshAuth(dir);
     await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
     await a.saveAccountTokens("bob@example.com", { refresh_token: "b" });
-    await a.writeDefault("bob@example.com");
     const loaded = (await a.loadAccounts({ gmailFor }))!;
-    expect([...loaded.clients.keys()]).toEqual(["amy@example.com", "bob@example.com"]);
-    expect((loaded.clients.get("bob@example.com") as unknown as { marker: unknown }).marker).toEqual({ refresh_token: "b" });
-    expect(loaded.default).toBe("bob@example.com");
+    expect([...loaded.accounts.keys()]).toEqual(["amy@example.com", "bob@example.com"]);
+    expect((loaded.accounts.get("bob@example.com")!.gmail as unknown as { marker: unknown }).marker).toEqual({ refresh_token: "b" });
+    expect(loaded.accounts.get("bob@example.com")!.token).toBe(await a.readAccountToken("bob@example.com"));
   });
 
-  it("falls back to the first account when the default file is stale", async () => {
+  it("generates and persists a token for an account that has none", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const a = await freshAuth(dir);
     await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
-    await a.writeDefault("gone@example.com");
-    expect((await a.loadAccounts({ gmailFor }))!.default).toBe("amy@example.com");
+    expect(await a.readAccountToken("amy@example.com")).toBeUndefined();
+    const loaded = (await a.loadAccounts({ gmailFor }))!;
+    const token = loaded.accounts.get("amy@example.com")!.token;
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect((await readFile(a.tokenPath("amy@example.com"), "utf8")).trim()).toBe(token);
+    // A second load keeps the same token.
+    expect((await a.loadAccounts({ gmailFor }))!.accounts.get("amy@example.com")!.token).toBe(token);
   });
 
-  it("skips an account whose token file fails to parse and falls back the default", async () => {
+  it("skips an account whose credentials file fails to parse", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const a = await freshAuth(dir);
     await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
     await a.saveAccountTokens("bob@example.com", { refresh_token: "b" });
     await writeFile(a.accountPath("bob@example.com"), "{not json");
-    await a.writeDefault("bob@example.com");
     const loaded = (await a.loadAccounts({ gmailFor }))!;
-    expect([...loaded.clients.keys()]).toEqual(["amy@example.com"]);
-    expect(loaded.default).toBe("amy@example.com");
+    expect([...loaded.accounts.keys()]).toEqual(["amy@example.com"]);
   });
 
-  it("migrates a legacy token file into the store under the profile email and sets it default", async () => {
+  it("migrates a legacy token file into the store under the profile email, with a token", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const legacy = path.join(dir, "tokens.json");
     await writeFile(legacy, JSON.stringify({ refresh_token: "old" }));
     const a = await freshAuth(dir);
     const loaded = (await a.loadAccounts({ legacyPaths: [legacy], profile: async () => "Legacy@Example.com", gmailFor }))!;
-    expect(loaded.default).toBe("legacy@example.com");
+    expect([...loaded.accounts.keys()]).toEqual(["legacy@example.com"]);
+    expect(loaded.accounts.get("legacy@example.com")!.token).toBe(await a.readAccountToken("legacy@example.com"));
     expect(await a.listAccounts()).toEqual(["legacy@example.com"]);
     expect(JSON.parse(await readFile(a.accountPath("legacy@example.com"), "utf8"))).toEqual({ refresh_token: "old" });
     // legacy === TOKEN_PATH (stubbed by freshAuth to <dir>/tokens.json): our own file, removed after migration.
@@ -89,7 +92,7 @@ describe("loadAccounts", () => {
       profile: async () => "seed@example.com",
       gmailFor,
     }))!;
-    expect(loaded.default).toBe("seed@example.com");
+    expect([...loaded.accounts.keys()]).toEqual(["seed@example.com"]);
     expect(await a.listAccounts()).toEqual(["seed@example.com"]);
     expect(JSON.parse(await readFile(seedFile, "utf8"))).toEqual({ refresh_token: "seed" }); // seed left in place
   });
@@ -144,36 +147,51 @@ describe("createClient", () => {
 });
 
 describe("account store", () => {
-  it("saves under the lower-cased email, lists sorted, and reads/writes the default", async () => {
+  it("saves under the lower-cased email and lists sorted", async () => {
     const dir = await tmp();
     const a = await freshAuth(dir);
     expect(await a.listAccounts()).toEqual([]);
-    expect(await a.readDefault()).toBeUndefined();
 
     await a.saveAccountTokens("Zed@Example.com", { refresh_token: "z" });
     await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
     expect(a.accountPath("Zed@Example.com")).toBe(path.join(dir, "accounts", "zed@example.com.json"));
     expect(JSON.parse(await readFile(a.accountPath("zed@example.com"), "utf8"))).toEqual({ refresh_token: "z" });
     expect(await a.listAccounts()).toEqual(["amy@example.com", "zed@example.com"]);
-
-    await a.writeDefault("Zed@Example.com");
-    expect(await a.readDefault()).toBe("zed@example.com");
   });
 
-  it("removeAccount deletes the file and repoints or clears the default", async () => {
+  it("keeps .token files out of listAccounts and normalizes tokenPath", async () => {
+    const dir = await tmp();
+    const a = await freshAuth(dir);
+    expect(a.tokenPath("Zed@Example.com")).toBe(path.join(dir, "accounts", "zed@example.com.token"));
+    await a.saveAccountTokens("zed@example.com", { refresh_token: "z" });
+    await a.writeAccountToken("Zed@Example.com", "sekrit");
+    expect(await a.listAccounts()).toEqual(["zed@example.com"]);
+    expect(await a.readAccountToken("zed@example.com")).toBe("sekrit");
+    expect(await a.readAccountToken("nobody@example.com")).toBeUndefined();
+  });
+
+  it("generateToken returns distinct 32-byte base64url secrets", async () => {
+    const a = await freshAuth(await tmp());
+    const one = a.generateToken();
+    expect(one).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Buffer.from(one, "base64url")).toHaveLength(32);
+    expect(a.generateToken()).not.toBe(one);
+  });
+
+  it("removeAccount deletes the credentials and the token file", async () => {
     const dir = await tmp();
     const a = await freshAuth(dir);
     await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await a.writeAccountToken("amy@example.com", "t-amy");
     await a.saveAccountTokens("bob@example.com", { refresh_token: "b" });
-    await a.writeDefault("amy@example.com");
 
     await a.removeAccount("amy@example.com");
     expect(await a.listAccounts()).toEqual(["bob@example.com"]);
-    expect(await a.readDefault()).toBe("bob@example.com");
+    expect(await a.readAccountToken("amy@example.com")).toBeUndefined();
 
+    // bob never had a token file; removal must still succeed.
     await a.removeAccount("bob@example.com");
     expect(await a.listAccounts()).toEqual([]);
-    expect(await a.readDefault()).toBeUndefined();
 
     await expect(a.removeAccount("nobody@example.com")).rejects.toThrow(/Unknown account "nobody@example.com"/);
   });
@@ -182,6 +200,7 @@ describe("account store", () => {
     const dir = await tmp();
     const a = await freshAuth(dir);
     expect(() => a.accountPath("../x")).toThrow(/Invalid account/);
+    expect(() => a.tokenPath("../x")).toThrow(/Invalid account/);
   });
 });
 
@@ -190,6 +209,7 @@ describe("authorize", () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const { authorize } = await freshAuth(dir);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
 
     let consentUrl = "";
     const done = authorize({
@@ -209,9 +229,13 @@ describe("authorize", () => {
     const ok = await fetch(new URL(`/oauth2callback?code=good&state=${state}`, redirect));
     expect(ok.status).toBe(200);
 
-    expect(await done).toBe("amy@example.com");
+    const result = await done;
+    expect(result.email).toBe("amy@example.com");
+    expect(result.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(JSON.parse(await readFile(path.join(dir, "accounts", "amy@example.com.json"), "utf8"))).toEqual({ refresh_token: "rt-for-good" });
-    expect(await readFile(path.join(dir, "default"), "utf8")).toBe("amy@example.com\n");
+    expect((await readFile(path.join(dir, "accounts", "amy@example.com.token"), "utf8")).trim()).toBe(result.token);
+    expect(log.mock.calls.flat()).toContain(result.token);
+    log.mockRestore();
   });
 
   it("wraps a profile lookup failure with an actionable message and writes no account file", async () => {
@@ -245,24 +269,34 @@ describe("authorize", () => {
     await expect(authorize({ open: () => {}, timeoutMs: 50 })).rejects.toThrow(/gmail-mcp auth/);
   });
 
-  it("adding a second account keeps the existing default", async () => {
+  it("adding a second account leaves the first account's token alone", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const a = await freshAuth(dir);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
     await a.saveAccountTokens("first@example.com", { refresh_token: "f" });
-    await a.writeDefault("first@example.com");
+    await a.writeAccountToken("first@example.com", "keep-me");
 
-    let consentUrl = "";
-    const done = a.authorize({
-      open: (url) => void (consentUrl = url),
-      exchange: async () => ({ refresh_token: "s" }),
-      profile: async () => "second@example.com",
-    });
-    await vi.waitFor(() => expect(consentUrl).not.toBe(""));
-    const u = new URL(consentUrl);
-    await fetch(new URL(`/oauth2callback?code=c&state=${u.searchParams.get("state")}`, new URL(u.searchParams.get("redirect_uri")!)));
-    expect(await done).toBe("second@example.com");
+    const run = async (email: string) => {
+      let consentUrl = "";
+      const done = a.authorize({
+        open: (url) => void (consentUrl = url),
+        exchange: async () => ({ refresh_token: "s" }),
+        profile: async () => email,
+      });
+      await vi.waitFor(() => expect(consentUrl).not.toBe(""));
+      const u = new URL(consentUrl);
+      await fetch(new URL(`/oauth2callback?code=c&state=${u.searchParams.get("state")}`, new URL(u.searchParams.get("redirect_uri")!)));
+      return done;
+    };
+
+    expect((await run("second@example.com")).email).toBe("second@example.com");
     expect(await a.listAccounts()).toEqual(["first@example.com", "second@example.com"]);
-    expect(await a.readDefault()).toBe("first@example.com");
+    expect(await a.readAccountToken("first@example.com")).toBe("keep-me");
+
+    // Re-authorizing an existing account keeps its token.
+    expect((await run("first@example.com")).token).toBe("keep-me");
+    expect(await a.readAccountToken("first@example.com")).toBe("keep-me");
+    log.mockRestore();
   });
 });

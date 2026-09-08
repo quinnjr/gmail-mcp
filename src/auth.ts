@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { google, type Auth, type gmail_v1 } from "googleapis";
 
@@ -21,10 +21,6 @@ export const SEED_TOKEN_PATH =
 
 export const ACCOUNTS_DIR =
   process.env.GMAIL_MCP_ACCOUNTS_DIR || path.join(dataDir, "gmail-mcp", "accounts");
-// A sibling of ACCOUNTS_DIR (not inside it) so an override of GMAIL_MCP_ACCOUNTS_DIR moves both
-// the account store and the default pointer together.
-export const DEFAULT_PATH = path.join(ACCOUNTS_DIR, "..", "default");
-
 export const normalizeEmail = (email: string): string => {
   const v = email.trim().toLowerCase();
   if (v.includes("/") || v.includes("\\") || v.includes("..")) {
@@ -33,6 +29,8 @@ export const normalizeEmail = (email: string): string => {
   return v;
 };
 export const accountPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalizeEmail(email)}.json`);
+/** Bearer secret for one account. `.token`, so listAccounts (which filters on `.json`) never sees it. */
+export const tokenPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalizeEmail(email)}.token`);
 
 export const unknownAccountError = (email: string, known: string[]): Error =>
   new Error(
@@ -63,18 +61,30 @@ export const listAccounts = async (): Promise<string[]> => {
   }
 };
 
-export const readDefault = async (): Promise<string | undefined> => {
+/** A caller's bearer secret: 32 random bytes, base64url. */
+export const generateToken = (): string => randomBytes(32).toString("base64url");
+
+export const readAccountToken = async (email: string): Promise<string | undefined> => {
   try {
-    const v = normalizeEmail(await fs.readFile(DEFAULT_PATH, "utf8"));
-    return v || undefined;
+    return (await fs.readFile(tokenPath(email), "utf8")).trim() || undefined;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw err;
   }
 };
 
-export const writeDefault = async (email: string): Promise<void> => {
-  await writeSecureFile(DEFAULT_PATH, `${normalizeEmail(email)}\n`);
+export const writeAccountToken = async (email: string, token: string): Promise<void> => {
+  await writeSecureFile(tokenPath(email), `${token}\n`);
+};
+
+/** The account's token, minting and persisting one when it has none. */
+const ensureToken = async (email: string, onCreate?: (path: string) => void): Promise<string> => {
+  const existing = await readAccountToken(email);
+  if (existing) return existing;
+  const token = generateToken();
+  await writeAccountToken(email, token);
+  onCreate?.(tokenPath(email));
+  return token;
 };
 
 export const removeAccount = async (email: string): Promise<void> => {
@@ -82,11 +92,7 @@ export const removeAccount = async (email: string): Promise<void> => {
   const known = await listAccounts();
   if (!known.includes(target)) throw unknownAccountError(target, known);
   await fs.rm(accountPath(target));
-  if ((await readDefault()) === target) {
-    const rest = known.filter((e) => e !== target);
-    if (rest.length) await writeDefault(rest[0]);
-    else await fs.rm(DEFAULT_PATH, { force: true });
-  }
+  await fs.rm(tokenPath(target), { force: true });
 };
 
 // Full mailbox (needed for messages.delete / batchDelete / insert / import) plus settings.
@@ -142,7 +148,8 @@ const fetchProfileEmail = async (client: Auth.OAuth2Client): Promise<string> => 
   return data.emailAddress;
 };
 
-export interface LoadedAccounts { clients: Map<string, gmail_v1.Gmail>; default: string }
+export interface LoadedAccount { gmail: gmail_v1.Gmail; token: string }
+export interface LoadedAccounts { accounts: Map<string, LoadedAccount> }
 export interface LoadAccountsOptions {
   profile?: (client: Auth.OAuth2Client) => Promise<string>;
   legacyPaths?: string[];
@@ -179,7 +186,7 @@ const migrateLegacy = async (
   return undefined;
 };
 
-/** Every stored account as a ready Gmail client, plus the default. Undefined when nothing is signed in. */
+/** Every stored account as a ready Gmail client plus its bearer token. Undefined when nothing is signed in. */
 export const loadAccounts = async ({
   profile = fetchProfileEmail,
   legacyPaths = [TOKEN_PATH, SEED_TOKEN_PATH],
@@ -189,20 +196,22 @@ export const loadAccounts = async ({
   if (emails.length === 0) {
     const migrated = await migrateLegacy(legacyPaths, profile);
     if (!migrated) return undefined;
-    await writeDefault(migrated.email);
     if (migrated.file === TOKEN_PATH) {
       await fs.rm(migrated.file, { force: true });
       console.error(`gmail-mcp: removed legacy ${migrated.file}`);
     }
     emails = [migrated.email];
   }
-  const clients = new Map<string, gmail_v1.Gmail>();
+  const accounts = new Map<string, LoadedAccount>();
   for (const email of emails) {
     const file = accountPath(email);
     try {
       const client = await createClient(undefined, file);
       client.setCredentials((await readJson(file)) as Auth.Credentials);
-      clients.set(email, gmailFor(client));
+      const token = await ensureToken(email, (p) =>
+        console.error(`gmail-mcp: generated a bearer token for ${email} at ${p}; print it with \`gmail-mcp token ${email}\``)
+      );
+      accounts.set(email, { gmail: gmailFor(client), token });
     } catch (err) {
       const msg = (err as Error)?.message ?? String(err);
       console.error(
@@ -210,13 +219,8 @@ export const loadAccounts = async ({
       );
     }
   }
-  if (clients.size === 0) return undefined;
-  let def = await readDefault();
-  if (!def || !clients.has(def)) {
-    if (def) console.error(`gmail-mcp: default account ${def} is not signed in; using ${[...clients.keys()][0]}`);
-    def = [...clients.keys()][0];
-  }
-  return { clients, default: def };
+  if (accounts.size === 0) return undefined;
+  return { accounts };
 };
 
 const openInBrowser = (url: string): void => {
@@ -232,7 +236,7 @@ export const authorize = async ({
   exchange = async (client, code) => (await client.getToken(code)).tokens,
   profile = fetchProfileEmail,
   timeoutMs = AUTH_TIMEOUT_MS,
-}: AuthorizeOptions = {}): Promise<string> => {
+}: AuthorizeOptions = {}): Promise<{ email: string; token: string }> => {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as { port: number };
@@ -282,9 +286,14 @@ export const authorize = async ({
     }
     const email = raw.trim().toLowerCase();
     await saveAccountTokens(email, tokens);
-    if ((await listAccounts()).length === 1) await writeDefault(email);
-    console.error(`Signed in as ${email}; tokens saved to ${accountPath(email)}`);
-    return email;
+    const token = await ensureToken(email);
+    console.error(
+      `Signed in as ${email}; credentials saved to ${accountPath(email)}, bearer token in ${tokenPath(email)}.\n` +
+        `Send it as \`Authorization: Bearer <token>\` on every /mcp request. The token is printed below:`
+    );
+    // The token IS this command's output; every other line went to stderr.
+    console.log(token);
+    return { email, token };
   } finally {
     server.close();
   }
