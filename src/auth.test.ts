@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -168,6 +168,19 @@ describe("account store", () => {
     expect(await a.listAccounts()).toEqual(["zed@example.com"]);
     expect(await a.readAccountToken("zed@example.com")).toBe("sekrit");
     expect(await a.readAccountToken("nobody@example.com")).toBeUndefined();
+  });
+
+  it("repairs drifted permissions on the token file and accounts dir on every write", async () => {
+    const dir = await tmp();
+    const a = await freshAuth(dir);
+    await a.writeAccountToken("amy@example.com", "t-amy");
+    await chmod(a.tokenPath("amy@example.com"), 0o644);
+    await chmod(path.join(dir, "accounts"), 0o755);
+
+    await a.writeAccountToken("amy@example.com", "t-amy-2");
+
+    expect((await stat(a.tokenPath("amy@example.com"))).mode & 0o777).toBe(0o600);
+    expect((await stat(path.join(dir, "accounts"))).mode & 0o777).toBe(0o700);
   });
 
   it("generateToken returns distinct 32-byte base64url secrets", async () => {

@@ -1,6 +1,6 @@
 import { createServer, request } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { gmail_v1 } from "googleapis";
 import { authenticate, createRequestHandler, type HandlerOptions } from "./index.js";
 
@@ -65,6 +65,18 @@ describe("authenticate", () => {
     expect(await authenticate(`bearer ${BOB}`, accounts.keys(), tokenFor)).toBe("bob@example.com");
     expect(await authenticate(`BEARER ${BOB}`, accounts.keys(), tokenFor)).toBe("bob@example.com");
   });
+
+  it("fails closed for one account whose token lookup throws, without blocking the others", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const flaky = async (email: string) => {
+      if (email === "bob@example.com") throw new Error("EACCES");
+      return tokenFor(email);
+    };
+    expect(await authenticate(`Bearer ${AMY}`, accounts.keys(), flaky)).toBe("amy@example.com");
+    expect(await authenticate(`Bearer ${BOB}`, accounts.keys(), flaky)).toBeUndefined();
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+  });
 });
 
 describe("request routing", () => {
@@ -73,13 +85,19 @@ describe("request routing", () => {
   });
 
   it("401s an unauthenticated or wrongly-authenticated request, before any session lookup", async () => {
+    // Auth precedes session lookup: replaying a real, live session id with no token or a
+    // wrong token must get the identical 401 body a dead session id would.
+    const sid = await openSession(AMY);
+    const bodies: unknown[] = [];
     for (const h of [headers, { ...headers, authorization: "Bearer wrong" }]) {
-      // A live session id must not be distinguishable from a dead one without a token.
-      const res = await fetch(`${base}/mcp`, { method: "POST", headers: { ...h, "mcp-session-id": "stale" }, body: JSON.stringify(initialize) });
+      const res = await fetch(`${base}/mcp`, { method: "POST", headers: { ...h, "mcp-session-id": sid }, body: JSON.stringify(initialize) });
       expect(res.status).toBe(401);
       expect(res.headers.get("www-authenticate")).toBe("Bearer");
-      expect(await res.json()).toMatchObject({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+      const json = await res.json();
+      expect(json).toMatchObject({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+      bodies.push(json);
     }
+    expect(bodies[0]).toEqual(bodies[1]);
   });
 
   it("404s an unknown session id for an authenticated caller", async () => {
@@ -110,12 +128,70 @@ describe("request routing", () => {
     expect(status).toBe(403);
   });
 
-  it("403s another account's token reusing a session id", async () => {
+  it("404s another account's token reusing a session id, indistinguishable from a dead session", async () => {
     const sid = await openSession(AMY);
     const res = await fetch(`${base}/mcp`, { method: "POST", headers: { ...as(BOB), "mcp-session-id": sid },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) });
-    expect(res.status).toBe(403);
-    expect(await res.json()).toMatchObject({ jsonrpc: "2.0", error: { code: -32001, message: "Forbidden" }, id: null });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+  });
+
+  it("drops a session and 404s once its token rotates, but accepts the new token on a fresh initialize", async () => {
+    const tokens = new Map<string, string>([["amy@example.com", AMY], ["bob@example.com", BOB]]);
+    const server = createServer();
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const { handler } = createRequestHandler({ accounts, host: "127.0.0.1", port, tokenFor: async (email) => tokens.get(email) });
+    server.on("request", handler);
+    const rotBase = `http://127.0.0.1:${port}`;
+    try {
+      const open = async (token: string): Promise<string> => {
+        const res = await fetch(`${rotBase}/mcp`, { method: "POST", headers: as(token), body: JSON.stringify(initialize) });
+        expect(res.status).toBe(200);
+        await res.text();
+        const sid = res.headers.get("mcp-session-id")!;
+        await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
+        return sid;
+      };
+      const sid = await open(AMY);
+      const T2 = "amy-token-2";
+      tokens.set("amy@example.com", T2);
+
+      const stale = await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(T2), "mcp-session-id": sid },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/list", params: {} }) });
+      expect(stale.status).toBe(404);
+      expect(await stale.json()).toMatchObject({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+
+      const fresh = await fetch(`${rotBase}/mcp`, { method: "POST", headers: as(T2), body: JSON.stringify(initialize) });
+      expect(fresh.status).toBe(200);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("401s (not 500) when the presented token's owner has an unreadable token file, other accounts unaffected", async () => {
+    const server = createServer();
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const flaky = async (email: string) => {
+      if (email === "bob@example.com") throw new Error("EACCES: permission denied");
+      return accounts.get(email)?.token;
+    };
+    const { handler } = createRequestHandler({ accounts, host: "127.0.0.1", port, tokenFor: flaky });
+    server.on("request", handler);
+    const flakyBase = `http://127.0.0.1:${port}`;
+    try {
+      const bobRes = await fetch(`${flakyBase}/mcp`, { method: "POST", headers: as(BOB), body: JSON.stringify(initialize) });
+      expect(bobRes.status).toBe(401);
+      const amyRes = await fetch(`${flakyBase}/mcp`, { method: "POST", headers: as(AMY), body: JSON.stringify(initialize) });
+      expect(amyRes.status).toBe(200);
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      server.close();
+      spy.mockRestore();
+    }
   });
 
   it("lists gmail_list_accounts and no default-account tool", async () => {
@@ -162,7 +238,13 @@ describe("request routing", () => {
       const stale = await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(AMY), "mcp-session-id": sid }, body: JSON.stringify(listTools) });
       expect(stale.status).toBe(401);
 
-      const fresh = await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(NEW_AMY), "mcp-session-id": sid }, body: JSON.stringify(listTools) });
+      // The old session is bound to the old token's digest; reusing its id with the new
+      // token 404s (and drops the session) rather than silently accepting it.
+      const reused = await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(NEW_AMY), "mcp-session-id": sid }, body: JSON.stringify(listTools) });
+      expect(reused.status).toBe(404);
+
+      // A fresh initialize with the new token works immediately, no restart needed.
+      const fresh = await fetch(`${rotBase}/mcp`, { method: "POST", headers: as(NEW_AMY), body: JSON.stringify(initialize) });
       expect(fresh.status).toBe(200);
     } finally {
       server.close();

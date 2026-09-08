@@ -5,8 +5,8 @@
 ### Added
 
 - Multiple accounts: sign in more than one Gmail account from a single server; a request acts as whichever account its bearer token belongs to.
-- Bearer authentication on `/mcp`: every request must send `Authorization: Bearer <token>`. Each signed-in account has its own token, and a request may only act on that account. Missing or unknown tokens get a 401; a valid token that does not own the presented `mcp-session-id` gets a 403.
-- An `account` input on every tool, so a call can name the account explicitly instead of relying on the token's own account.
+- Bearer authentication on `/mcp`: every request must send `Authorization: Bearer <token>`. Each signed-in account has its own token, and a request may only act on that account. Missing or unknown tokens get a 401; a session id that belongs to another account, or whose token has since rotated, gets the same 404 as an unknown session id. Rotating a token takes effect on the very next request (tokens are read from disk per request); adding a new account requires a server restart.
+- An `account` input on every tool, accepted for compatibility — it must name the token's own account.
 - `gmail_list_accounts` tool to list the accounts the calling token can act as.
 - `gmail-mcp accounts` CLI command to list signed-in accounts.
 - `gmail-mcp token <email>` to print an account's bearer token on stdout, minting one if needed; `--rotate` replaces it.

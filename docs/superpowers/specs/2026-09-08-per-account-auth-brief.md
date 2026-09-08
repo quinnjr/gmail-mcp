@@ -20,9 +20,10 @@ one signed-in Gmail account, and a request may only act on that account.
 - Requests without a valid token get HTTP 401 with header `WWW-Authenticate: Bearer` and
   a JSON-RPC error body `{ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }`.
   Requests whose token is valid but does not match the account bound to the
-  `mcp-session-id` they present get HTTP 403 with the same shape and message `"Forbidden"`.
-  Check auth BEFORE the session lookup so an unauthenticated probe cannot distinguish a
-  live session id from a dead one.
+  `mcp-session-id` they present get the same HTTP 404 `"Session not found"` body an unknown
+  session id gets, so a live session owned by another account is indistinguishable from a
+  dead one. Check auth BEFORE the session lookup so an unauthenticated probe cannot
+  distinguish a live session id from a dead one.
 - Token comparison is constant time: compare `sha256(candidate)` against `sha256(stored)`
   with `crypto.timingSafeEqual`, for every stored token (there are only a few accounts).
 
@@ -75,7 +76,9 @@ the matching email or undefined, using the constant-time comparison above. Expor
 test it directly.
 
 Handler order: path check → `authenticate` (401 on failure) → session lookup (404 as
-today) → if the session exists and `session.email !== email` → 403 → otherwise as today.
+today) → if the session exists and `session.email !== email`, or the presented token's
+digest no longer matches the session's (the token rotated) → 404 "Session not found"
+→ otherwise as today.
 A new session registers tools with `{ clients: new Map([[email, gmail]]), default: email }`
 and stores `email` on the session.
 

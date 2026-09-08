@@ -38,8 +38,14 @@ export const unknownAccountError = (email: string, known: string[]): Error =>
   );
 
 const writeSecureFile = async (file: string, contents: string): Promise<void> => {
-  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const dir = path.dirname(file);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  // mkdir's mode only applies when it creates the directory, and writeFile's mode only
+  // applies when it creates the file; chmod explicitly so a pre-existing, drifted-permission
+  // directory or file is repaired on every write.
+  await fs.chmod(dir, 0o700);
   await fs.writeFile(file, contents, { mode: 0o600 });
+  await fs.chmod(file, 0o600);
 };
 
 const writeJson = async (file: string, value: unknown): Promise<void> => {

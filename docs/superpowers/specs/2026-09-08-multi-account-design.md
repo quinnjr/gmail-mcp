@@ -55,7 +55,7 @@ token lands in the right file.
 |---|---|
 | `gmail-mcp auth` | Consent flow with `prompt: "consent select_account"` so the user can pick a second Google account. Saves `accounts/<email>.json`. If no default exists, sets it. Prints the email. |
 | `gmail-mcp accounts` | Lists stored emails, marking the default with `*`. |
-| `gmail-mcp auth --default <email>` | Sets the default. Errors if unknown, listing known emails. |
+| `gmail-mcp auth --default <email>` | Superseded by per-account tokens, see below. |
 | `gmail-mcp auth --remove <email>` | Deletes the file. If it was the default, the default becomes the first remaining account or is cleared. |
 
 All output goes to stderr, as today.
@@ -96,9 +96,7 @@ before any Google call.
 Two new tools, both without `userId`:
 
 - `gmail_list_accounts` returns `{ accounts: string[], default: string }`.
-- `gmail_set_default_account({ account })` changes the in-process default and
-  writes the `default` file so the choice survives a restart. Because
-  `Accounts` is shared by every session, the change is server-wide.
+- `gmail_set_default_account({ account })`: superseded by per-account tokens, see below.
 
 ### 5. Errors
 
@@ -147,18 +145,30 @@ both files.
 
 ### Request handling
 
-`authenticate(header, accounts)` parses `Bearer <token>` (case-insensitive
-scheme, single space) and returns the owning email, comparing
-`sha256(candidate)` against `sha256(stored)` with `crypto.timingSafeEqual` for
-every stored token. The handler order is: path check → `authenticate` →
-session lookup → session/account match. Authentication runs *before* the
-session lookup so an unauthenticated probe cannot distinguish a live session id
-from a dead one.
+`authenticate(header, emails, tokenFor)` parses `Bearer <token>`
+(case-insensitive scheme, single space) and returns the owning email,
+comparing `sha256(candidate)` against `sha256(stored)` with
+`crypto.timingSafeEqual` for every account's token. `tokenFor` is called fresh
+for every request (the server's `tokenFor` reads the token file from disk
+each time), so a rotated token takes effect on the very next request with no
+restart; adding a brand-new account still requires a restart, since the
+account map itself is only built at startup. Each `tokenFor` call is wrapped
+in try/catch so one account's unreadable token file fails closed for that
+account only, logging the email and continuing to check the rest. The handler
+order is: path check → `authenticate` → session lookup → session/account
+match. Authentication runs *before* the session lookup so an unauthenticated
+probe cannot distinguish a live session id from a dead one.
 
 - No or invalid token → HTTP 401, header `WWW-Authenticate: Bearer`, body
   `{ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }`.
-- Valid token that does not own the presented `mcp-session-id` → HTTP 403 with
-  the same shape and message `"Forbidden"`.
+- Valid token whose email does not own the presented `mcp-session-id`, or
+  whose sha256 digest no longer matches the digest recorded when that session
+  was opened (the account's token rotated) → the same HTTP 404
+  `"Session not found"` body an unknown session id gets, so a live session
+  cannot be told apart from a dead one. On a digest mismatch the server also
+  closes that session's transport and deletes it from the session map, so any
+  SSE stream opened under the old token is dropped and the client is forced
+  to re-initialize with the new token.
 
 A new session registers tools with only its own account
 (`{ clients: new Map([[email, gmail]]), default: email }`) and records `email`

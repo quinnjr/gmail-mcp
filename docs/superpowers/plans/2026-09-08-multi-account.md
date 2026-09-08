@@ -1,5 +1,10 @@
 # Multiple Gmail Sign-ons Implementation Plan
 
+> **Superseded 2026-09-08:** the default-account machinery this plan describes (the
+> `default` marker file, `--default`, `gmail_set_default_account`) was replaced by
+> per-account bearer tokens the same day. See the "Per-account authentication" section of
+> `docs/superpowers/specs/2026-09-08-multi-account-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** One running gmail-mcp server serves several signed-in Gmail accounts, chosen per tool call by an optional `account` input that falls back to a configurable default.

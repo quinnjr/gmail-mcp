@@ -21,6 +21,8 @@ interface Session {
   lastSeen: number;
   /** The account whose bearer token opened this session; no other token may use it. */
   email: string;
+  /** sha256 hex of the token that opened this session, so a rotation revokes it even for the same email. */
+  digest: string;
 }
 
 export interface HandlerOptions {
@@ -49,7 +51,15 @@ export const authenticate = async (
   const candidate = digest(match[1]);
   let found: string | undefined;
   for (const email of emails) {
-    const token = await tokenFor(email);
+    let token: string | undefined;
+    try {
+      token = await tokenFor(email);
+    } catch (err) {
+      // An unreadable token file fails closed for that one account only; every other
+      // account's token is still checked.
+      console.error(`gmail-mcp: could not read the token for ${email}:`, err);
+      continue;
+    }
     if (token && timingSafeEqual(candidate, digest(token))) found = email;
   }
   return found;
@@ -86,11 +96,14 @@ export const createRequestHandler = ({
       // Authenticate before the session lookup so an unauthenticated probe cannot tell a live
       // session id from a dead one.
       const auth = req.headers.authorization;
-      const email = await authenticate(Array.isArray(auth) ? auth[0] : auth, accounts.keys(), tokenFor);
+      const authHeader = Array.isArray(auth) ? auth[0] : auth;
+      const email = await authenticate(authHeader, accounts.keys(), tokenFor);
       if (!email) {
         rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
         return;
       }
+      // authenticate() only returns an email once its own regex matched this header.
+      const tokenDigest = digest(/^Bearer (\S+)$/i.exec(authHeader ?? "")![1]).toString("hex");
       const header = req.headers["mcp-session-id"];
       const sessionId = Array.isArray(header) ? header[0] : header;
       const existing = sessionId ? sessions.get(sessionId) : undefined;
@@ -99,8 +112,18 @@ export const createRequestHandler = ({
         return;
       }
       if (existing) {
+        // A live session id owned by another account must be indistinguishable from a dead
+        // one: same 404 both ways.
         if (existing.email !== email) {
-          rpcError(res, 403, "Forbidden");
+          rpcError(res, 404, "Session not found");
+          return;
+        }
+        // Same account, different token: the account's token rotated. Drop the session so any
+        // SSE stream opened under the old token is dropped too, and the client re-initializes.
+        if (existing.digest !== tokenDigest) {
+          sessions.delete(sessionId!);
+          existing.transport.close().catch(() => {});
+          rpcError(res, 404, "Session not found");
           return;
         }
         existing.lastSeen = Date.now();
@@ -116,7 +139,7 @@ export const createRequestHandler = ({
         enableDnsRebindingProtection: true,
         allowedHosts,
         onsessioninitialized: (id: string) => {
-          sessions.set(id, { transport, lastSeen: Date.now(), email });
+          sessions.set(id, { transport, lastSeen: Date.now(), email, digest: tokenDigest });
         },
       });
       transport.onclose = () => transport.sessionId && sessions.delete(transport.sessionId);
@@ -164,6 +187,8 @@ export const cli = async (argv: string[]): Promise<boolean> => {
     if (value && value !== "--rotate") throw new Error(`Unknown option ${value}. Usage: gmail-mcp token <email> [--rotate]`);
     const rotate = value === "--rotate";
     const token = (!rotate && (await readAccountToken(email))) || generateToken();
+    // Rewriting even the unrotated case is deliberate: it lets writeSecureFile's chmod
+    // repair a token file or accounts dir whose permissions have drifted.
     await writeAccountToken(email, token);
     console.error(`Bearer token for ${email}${rotate ? " (rotated; existing clients must be updated)" : ""}:`);
     console.log(token);
