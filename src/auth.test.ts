@@ -2,13 +2,8 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadTokens } from "./auth.js";
 
 const tmp = () => mkdtemp(path.join(os.tmpdir(), "gmail-mcp-"));
-const client = () => {
-  const calls: unknown[] = [];
-  return { calls, setCredentials: (c: unknown) => void calls.push(c) };
-};
 
 // CREDENTIALS_PATH / TOKEN_PATH are read at import time; re-import per test with env set.
 const freshAuth = async (dir: string) => {
@@ -23,32 +18,58 @@ const writeCredentials = (dir: string) =>
 
 afterEach(() => vi.unstubAllEnvs());
 
-describe("loadTokens", () => {
-  it("prefers the first path, falls back to the seed, and reports when neither exists", async () => {
+describe("loadAccounts", () => {
+  const gmailFor = (client: { credentials: unknown }) => ({ marker: client.credentials }) as unknown as import("googleapis").gmail_v1.Gmail;
+
+  it("returns undefined when nothing is stored and no legacy file exists", async () => {
     const dir = await tmp();
-    const own = path.join(dir, "own.json");
-    const seed = path.join(dir, "seed.json");
-    await writeFile(seed, JSON.stringify({ refresh_token: "seed" }));
-
-    const c1 = client();
-    expect(await loadTokens(c1, [own, seed])).toBe(true);
-    expect(c1.calls).toEqual([{ refresh_token: "seed" }]);
-
-    await writeFile(own, JSON.stringify({ refresh_token: "own" }));
-    const c2 = client();
-    expect(await loadTokens(c2, [own, seed])).toBe(true);
-    expect(c2.calls).toEqual([{ refresh_token: "own" }]);
-
-    const c3 = client();
-    expect(await loadTokens(c3, [path.join(dir, "missing.json")])).toBe(false);
-    expect(c3.calls).toEqual([]);
+    await writeCredentials(dir);
+    const a = await freshAuth(dir);
+    expect(await a.loadAccounts({ legacyPaths: [path.join(dir, "missing.json")], gmailFor })).toBeUndefined();
   });
 
-  it("rethrows anything other than a missing file", async () => {
+  it("builds one client per account and honours the default file", async () => {
     const dir = await tmp();
+    await writeCredentials(dir);
+    const a = await freshAuth(dir);
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await a.saveAccountTokens("bob@example.com", { refresh_token: "b" });
+    await a.writeDefault("bob@example.com");
+    const loaded = (await a.loadAccounts({ gmailFor }))!;
+    expect([...loaded.clients.keys()]).toEqual(["amy@example.com", "bob@example.com"]);
+    expect((loaded.clients.get("bob@example.com") as unknown as { marker: unknown }).marker).toEqual({ refresh_token: "b" });
+    expect(loaded.default).toBe("bob@example.com");
+  });
+
+  it("falls back to the first account when the default file is stale", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const a = await freshAuth(dir);
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await a.writeDefault("gone@example.com");
+    expect((await a.loadAccounts({ gmailFor }))!.default).toBe("amy@example.com");
+  });
+
+  it("migrates a legacy token file into the store under the profile email and sets it default", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const legacy = path.join(dir, "tokens.json");
+    await writeFile(legacy, JSON.stringify({ refresh_token: "old" }));
+    const a = await freshAuth(dir);
+    const loaded = (await a.loadAccounts({ legacyPaths: [legacy], profile: async () => "Legacy@Example.com", gmailFor }))!;
+    expect(loaded.default).toBe("legacy@example.com");
+    expect(await a.listAccounts()).toEqual(["legacy@example.com"]);
+    expect(JSON.parse(await readFile(a.accountPath("legacy@example.com"), "utf8"))).toEqual({ refresh_token: "old" });
+    expect(JSON.parse(await readFile(legacy, "utf8"))).toEqual({ refresh_token: "old" }); // left in place
+  });
+
+  it("rethrows anything other than a missing legacy file", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
     const bad = path.join(dir, "bad.json");
     await writeFile(bad, "{not json");
-    await expect(loadTokens(client(), [bad])).rejects.toThrow(SyntaxError);
+    const a = await freshAuth(dir);
+    await expect(a.loadAccounts({ legacyPaths: [bad], gmailFor })).rejects.toThrow(SyntaxError);
   });
 });
 

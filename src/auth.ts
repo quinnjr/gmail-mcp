@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { google, type Auth } from "googleapis";
+import { google, type Auth, type gmail_v1 } from "googleapis";
 
 const configDir = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 const dataDir = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
@@ -109,22 +109,6 @@ export const createClient = async (redirectUri?: string, tokenFile?: string): Pr
   return client;
 };
 
-/** Load stored tokens (own, then google-mcp's). Returns false when neither exists. */
-export const loadTokens = async (
-  client: Pick<Auth.OAuth2Client, "setCredentials">,
-  paths: string[] = [TOKEN_PATH, SEED_TOKEN_PATH]
-): Promise<boolean> => {
-  for (const file of paths) {
-    try {
-      client.setCredentials(await readJson(file));
-      return true;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
-  }
-  return false;
-};
-
 export interface AuthorizeOptions {
   /** Hand the consent URL to the user. Defaults to xdg-open plus a stderr print. */
   open?: (url: string) => void;
@@ -139,6 +123,64 @@ const fetchProfileEmail = async (client: Auth.OAuth2Client): Promise<string> => 
   const { data } = await google.gmail({ version: "v1", auth: client }).users.getProfile({ userId: "me" });
   if (!data.emailAddress) throw new Error("Gmail getProfile returned no emailAddress");
   return data.emailAddress;
+};
+
+export interface LoadedAccounts { clients: Map<string, gmail_v1.Gmail>; default: string }
+export interface LoadAccountsOptions {
+  profile?: (client: Auth.OAuth2Client) => Promise<string>;
+  legacyPaths?: string[];
+  gmailFor?: (client: Auth.OAuth2Client) => gmail_v1.Gmail;
+}
+
+/** Copy the first legacy token file into the account store. Returns the email, or undefined when none exists. */
+const migrateLegacy = async (
+  legacyPaths: string[],
+  profile: (client: Auth.OAuth2Client) => Promise<string>
+): Promise<string | undefined> => {
+  for (const file of legacyPaths) {
+    let tokens: Auth.Credentials;
+    try {
+      tokens = (await readJson(file)) as Auth.Credentials;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw err;
+    }
+    const client = await createClient();
+    client.setCredentials(tokens);
+    const email = (await profile(client)).trim().toLowerCase();
+    await saveAccountTokens(email, tokens);
+    console.error(`gmail-mcp: migrated ${file} to ${accountPath(email)}`);
+    return email;
+  }
+  return undefined;
+};
+
+/** Every stored account as a ready Gmail client, plus the default. Undefined when nothing is signed in. */
+export const loadAccounts = async ({
+  profile = fetchProfileEmail,
+  legacyPaths = [TOKEN_PATH, SEED_TOKEN_PATH],
+  gmailFor = (auth) => google.gmail({ version: "v1", auth }),
+}: LoadAccountsOptions = {}): Promise<LoadedAccounts | undefined> => {
+  let emails = await listAccounts();
+  if (emails.length === 0) {
+    const migrated = await migrateLegacy(legacyPaths, profile);
+    if (!migrated) return undefined;
+    await writeDefault(migrated);
+    emails = [migrated];
+  }
+  const clients = new Map<string, gmail_v1.Gmail>();
+  for (const email of emails) {
+    const file = accountPath(email);
+    const client = await createClient(undefined, file);
+    client.setCredentials((await readJson(file)) as Auth.Credentials);
+    clients.set(email, gmailFor(client));
+  }
+  let def = await readDefault();
+  if (!def || !clients.has(def)) {
+    if (def) console.error(`gmail-mcp: default account ${def} is not signed in; using ${emails[0]}`);
+    def = emails[0];
+  }
+  return { clients, default: def };
 };
 
 const openInBrowser = (url: string): void => {
