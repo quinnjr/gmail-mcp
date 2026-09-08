@@ -120,20 +120,23 @@ describe("authorize", () => {
     const done = authorize({
       open: (url) => void (consentUrl = url),
       exchange: async (_client, code) => ({ refresh_token: `rt-for-${code}` }),
+      profile: async () => "Amy@Example.com",
     });
     await vi.waitFor(() => expect(consentUrl).not.toBe(""));
     const u = new URL(consentUrl);
     const redirect = new URL(u.searchParams.get("redirect_uri")!);
     const state = u.searchParams.get("state")!;
     expect(u.searchParams.get("scope")).toContain("https://mail.google.com/");
+    expect(u.searchParams.get("prompt")).toBe("consent select_account");
 
     expect((await fetch(new URL("/favicon.ico", redirect))).status).toBe(404);
     expect((await fetch(new URL(`/oauth2callback?code=evil&state=wrong`, redirect))).status).toBe(400);
     const ok = await fetch(new URL(`/oauth2callback?code=good&state=${state}`, redirect));
     expect(ok.status).toBe(200);
 
-    await done;
-    expect(JSON.parse(await readFile(path.join(dir, "tokens.json"), "utf8"))).toEqual({ refresh_token: "rt-for-good" });
+    expect(await done).toBe("amy@example.com");
+    expect(JSON.parse(await readFile(path.join(dir, "accounts", "amy@example.com.json"), "utf8"))).toEqual({ refresh_token: "rt-for-good" });
+    expect(await readFile(path.join(dir, "default"), "utf8")).toBe("amy@example.com\n");
   });
 
   it("gives up after the timeout with a message naming the fix", async () => {
@@ -141,5 +144,26 @@ describe("authorize", () => {
     await writeCredentials(dir);
     const { authorize } = await freshAuth(dir);
     await expect(authorize({ open: () => {}, timeoutMs: 50 })).rejects.toThrow(/gmail-mcp auth/);
+  });
+
+  it("adding a second account keeps the existing default", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const a = await freshAuth(dir);
+    await a.saveAccountTokens("first@example.com", { refresh_token: "f" });
+    await a.writeDefault("first@example.com");
+
+    let consentUrl = "";
+    const done = a.authorize({
+      open: (url) => void (consentUrl = url),
+      exchange: async () => ({ refresh_token: "s" }),
+      profile: async () => "second@example.com",
+    });
+    await vi.waitFor(() => expect(consentUrl).not.toBe(""));
+    const u = new URL(consentUrl);
+    await fetch(new URL(`/oauth2callback?code=c&state=${u.searchParams.get("state")}`, new URL(u.searchParams.get("redirect_uri")!)));
+    expect(await done).toBe("second@example.com");
+    expect(await a.listAccounts()).toEqual(["first@example.com", "second@example.com"]);
+    expect(await a.readDefault()).toBe("first@example.com");
   });
 });

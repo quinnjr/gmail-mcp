@@ -95,7 +95,10 @@ export const createRequestHandler = ({ gmail, host, port, sessions = new Map() }
 // All diagnostics go to stderr on purpose: stdout stays quiet so a process manager
 // or shell pipeline never mistakes status lines for output.
 const main = async (): Promise<void> => {
-  if (process.argv[2] === "auth") return authorize();
+  if (process.argv[2] === "auth") {
+    await authorize();
+    return;
+  }
 
   const auth = await createClient();
   if (!(await loadTokens(auth))) {

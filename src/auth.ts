@@ -130,8 +130,16 @@ export interface AuthorizeOptions {
   open?: (url: string) => void;
   /** Exchange the callback code for tokens. Defaults to the OAuth client's getToken. */
   exchange?: (client: Auth.OAuth2Client, code: string) => Promise<Auth.Credentials>;
+  /** Look up the signed-in address after consent. Defaults to Gmail's getProfile. */
+  profile?: (client: Auth.OAuth2Client) => Promise<string>;
   timeoutMs?: number;
 }
+
+const fetchProfileEmail = async (client: Auth.OAuth2Client): Promise<string> => {
+  const { data } = await google.gmail({ version: "v1", auth: client }).users.getProfile({ userId: "me" });
+  if (!data.emailAddress) throw new Error("Gmail getProfile returned no emailAddress");
+  return data.emailAddress;
+};
 
 const openInBrowser = (url: string): void => {
   console.error(`Open this URL to authorize gmail-mcp:\n\n${url}\n`);
@@ -140,19 +148,20 @@ const openInBrowser = (url: string): void => {
     .unref();
 };
 
-/** Interactive browser consent for the full scope set; writes TOKEN_PATH. */
+/** Interactive browser consent for the full scope set; saves tokens per account. */
 export const authorize = async ({
   open = openInBrowser,
   exchange = async (client, code) => (await client.getToken(code)).tokens,
+  profile = fetchProfileEmail,
   timeoutMs = AUTH_TIMEOUT_MS,
-}: AuthorizeOptions = {}): Promise<void> => {
+}: AuthorizeOptions = {}): Promise<string> => {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as { port: number };
   const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
   const client = await createClient(redirectUri);
   const state = randomUUID();
-  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: SCOPES, state });
+  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: SCOPES, state });
 
   try {
     const code = await new Promise<string>((resolve, reject) => {
@@ -184,8 +193,13 @@ export const authorize = async ({
       });
       open(url);
     });
-    await writeJson(TOKEN_PATH, await exchange(client, code));
-    console.error(`Tokens saved to ${TOKEN_PATH}`);
+    const tokens = await exchange(client, code);
+    client.setCredentials(tokens);
+    const email = (await profile(client)).trim().toLowerCase();
+    await saveAccountTokens(email, tokens);
+    if (!(await readDefault())) await writeDefault(email);
+    console.error(`Signed in as ${email}; tokens saved to ${accountPath(email)}`);
+    return email;
   } finally {
     server.close();
   }
