@@ -1,8 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { gmail_v1 } from "googleapis";
 import { z } from "zod";
+import { normalizeEmail, unknownAccountError } from "./auth.js";
 import { buildRaw, parseMessage } from "./mime.js";
 
 type Gmail = gmail_v1.Gmail;
@@ -11,7 +14,7 @@ export interface Accounts {
   clients: Map<string, Gmail>;
   default: string;
   /** Persist a new default. Called by gmail_set_default_account after validation. */
-  setDefault?: (email: string) => Promise<void>;
+  setDefault: (email: string) => Promise<void>;
 }
 
 const json = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v ?? {}, null, 2) }] });
@@ -86,10 +89,9 @@ const classification = {
 export const registerTools = (server: McpServer, accounts: Accounts): void => {
   const known = () => [...accounts.clients.keys()].sort();
   const resolve = (account?: string): { email: string; gmail: Gmail } => {
-    const email = (account?.trim() || accounts.default).trim().toLowerCase();
+    const email = normalizeEmail(account?.trim() || accounts.default);
     const gmail = accounts.clients.get(email);
-    if (!gmail)
-      throw new Error(`Unknown account "${email}". Signed-in accounts: ${known().join(", ")}. Run \`gmail-mcp auth\` to add one.`);
+    if (!gmail) throw unknownAccountError(email, known());
     return { email, gmail };
   };
 
@@ -100,10 +102,16 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     call: Call
   ) => ReturnType<ToolCallback<S>>;
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, handler: Handler<S>) =>
-    server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => {
+    server.registerTool(name, { description, inputSchema: shape }, ((
+      args: z.infer<z.ZodObject<S>>,
+      _extra: RequestHandlerExtra<ServerRequest, ServerNotification>
+    ) => {
       const { account, ...rest } = args as { account?: string };
       const { email, gmail } = resolve(account);
       return handler(rest as Omit<z.infer<z.ZodObject<S>>, "account">, gmail, caller(email));
+      // Handler<S>'s return type (ReturnType<ToolCallback<S>>, reached through the generic `call`)
+      // doesn't structurally overlap CallToolResult closely enough for a single `as ToolCallback<S>`;
+      // TS requires routing through `unknown` first.
     }) as unknown as ToolCallback<S>);
 
   // ---- accounts ----
@@ -111,10 +119,11 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     () => json({ accounts: known(), default: accounts.default }));
   server.registerTool("gmail_set_default_account",
     { description: "Change which signed-in account tools use when `account` is omitted (server-wide, persisted)",
-      inputSchema: { account: z.string() } },
+      inputSchema: { account: z.string().min(1) } },
     async ({ account }) => {
-      const { email } = resolve(account);
-      await accounts.setDefault?.(email);
+      const email = normalizeEmail(account);
+      if (!accounts.clients.has(email)) throw unknownAccountError(email, known());
+      await accounts.setDefault(email);
       accounts.default = email;
       return json({ default: email });
     });

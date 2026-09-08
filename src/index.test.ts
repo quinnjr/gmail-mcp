@@ -2,7 +2,7 @@ import { createServer, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { gmail_v1 } from "googleapis";
-import { createRequestHandler } from "./index.js";
+import { createRequestHandler, isLoopback } from "./index.js";
 
 let base = "";
 let close: () => void;
@@ -13,7 +13,7 @@ beforeAll(async () => {
   const port = (server.address() as AddressInfo).port;
   const gmail = { users: { settings: {} } } as unknown as gmail_v1.Gmail;
   const { handler } = createRequestHandler({
-    accounts: { clients: new Map([["amy@example.com", gmail]]), default: "amy@example.com" },
+    accounts: { clients: new Map([["amy@example.com", gmail]]), default: "amy@example.com", setDefault: async () => {} },
     host: "127.0.0.1", port,
   });
   server.on("request", handler);
@@ -25,6 +25,20 @@ afterAll(() => close());
 const initialize = { jsonrpc: "2.0", id: 1, method: "initialize",
   params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } };
 const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+
+describe("isLoopback", () => {
+  it("treats loopback hosts as loopback", () => {
+    for (const host of ["127.0.0.1", "localhost", "::1", "[::1]"]) {
+      expect(isLoopback(host)).toBe(true);
+    }
+  });
+
+  it("treats non-loopback hosts as not loopback", () => {
+    for (const host of ["0.0.0.0", "192.168.1.5"]) {
+      expect(isLoopback(host)).toBe(false);
+    }
+  });
+});
 
 describe("request routing", () => {
   it("404s unknown paths and unknown session ids with a JSON-RPC error", async () => {

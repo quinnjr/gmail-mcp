@@ -89,6 +89,12 @@ describe("cli", () => {
     await expect(cli(["auth", "--bogus"])).rejects.toThrow(/Unknown option --bogus/);
   });
 
+  it("auth: with no flag, runs authorize() and propagates its failure", async () => {
+    const dir = await tmp();
+    const { cli } = await freshCli(dir);
+    await expect(cli(["auth"])).rejects.toThrow(/ENOENT|no such file/);
+  });
+
   it("returns false for anything else, leaving it to the caller", async () => {
     const dir = await tmp();
     const { cli } = await freshCli(dir);

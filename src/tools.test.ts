@@ -158,17 +158,37 @@ describe("registerTools", () => {
     await expect(invoke(tools.get("gmail_set_default_account")!, { account: "nope@example.com" })).rejects.toThrow(/Unknown account/);
   });
 
+  it("gmail_set_default_account rejects a blank account at the schema level", async () => {
+    const t = tools.get("gmail_set_default_account")!;
+    expect(() => z.object(t.shape).parse({ account: "" })).toThrow();
+  });
+
+  it("gmail_set_default_account rejects a whitespace-only account as unknown once normalized", async () => {
+    const t = tools.get("gmail_set_default_account")!;
+    await expect(invoke(t, { account: "  " })).rejects.toThrow(/Unknown account ""/);
+  });
+
   it("wraps Google auth errors with the account and the command that fixes them", async () => {
     const failing = { users: { getProfile: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })), settings: {} } } as unknown as gmail_v1.Gmail;
-    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_profile")!;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", setDefault: async () => {} }).get("gmail_get_profile")!;
     await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
+  });
+
+  it("wraps a 403 insufficient-scope error on gmail_get_profile with the account and the fix", async () => {
+    const failing = {
+      users: { getProfile: () => Promise.reject(Object.assign(new Error("insufficient scope"), { code: 403 })), settings: {} },
+    } as unknown as gmail_v1.Gmail;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", setDefault: async () => {} }).get("gmail_get_profile")!;
+    // explain()'s 403-scope message puts the raw Google error last, after the `gmail-mcp auth` fix
+    // instruction, so this checks the account + fix + raw error text in the order they actually appear.
+    await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth.*insufficient scope/);
   });
 
   it("wraps a failing messages.get on gmail_get_message with the account and the fix", async () => {
     const failing = {
       users: { messages: { get: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })) }, settings: {} },
     } as unknown as gmail_v1.Gmail;
-    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_message")!;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", setDefault: async () => {} }).get("gmail_get_message")!;
     await expect(invoke(t, { id: "m" })).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
   });
 });

@@ -50,6 +50,19 @@ describe("loadAccounts", () => {
     expect((await a.loadAccounts({ gmailFor }))!.default).toBe("amy@example.com");
   });
 
+  it("skips an account whose token file fails to parse and falls back the default", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const a = await freshAuth(dir);
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await a.saveAccountTokens("bob@example.com", { refresh_token: "b" });
+    await writeFile(a.accountPath("bob@example.com"), "{not json");
+    await a.writeDefault("bob@example.com");
+    const loaded = (await a.loadAccounts({ gmailFor }))!;
+    expect([...loaded.clients.keys()]).toEqual(["amy@example.com"]);
+    expect(loaded.default).toBe("amy@example.com");
+  });
+
   it("migrates a legacy token file into the store under the profile email and sets it default", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
@@ -60,7 +73,25 @@ describe("loadAccounts", () => {
     expect(loaded.default).toBe("legacy@example.com");
     expect(await a.listAccounts()).toEqual(["legacy@example.com"]);
     expect(JSON.parse(await readFile(a.accountPath("legacy@example.com"), "utf8"))).toEqual({ refresh_token: "old" });
-    expect(JSON.parse(await readFile(legacy, "utf8"))).toEqual({ refresh_token: "old" }); // left in place
+    // legacy === TOKEN_PATH (stubbed by freshAuth to <dir>/tokens.json): our own file, removed after migration.
+    await expect(readFile(legacy, "utf8")).rejects.toThrow(/ENOENT/);
+  });
+
+  it("migrates from a seed file that isn't TOKEN_PATH when it is the only one that exists", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const missingOwn = path.join(dir, "tokens.json");
+    const seedFile = path.join(dir, "seed-tokens.json");
+    await writeFile(seedFile, JSON.stringify({ refresh_token: "seed" }));
+    const a = await freshAuth(dir);
+    const loaded = (await a.loadAccounts({
+      legacyPaths: [missingOwn, seedFile],
+      profile: async () => "seed@example.com",
+      gmailFor,
+    }))!;
+    expect(loaded.default).toBe("seed@example.com");
+    expect(await a.listAccounts()).toEqual(["seed@example.com"]);
+    expect(JSON.parse(await readFile(seedFile, "utf8"))).toEqual({ refresh_token: "seed" }); // seed left in place
   });
 
   it("wraps a profile lookup failure during migration with an actionable message", async () => {
@@ -146,6 +177,12 @@ describe("account store", () => {
 
     await expect(a.removeAccount("nobody@example.com")).rejects.toThrow(/Unknown account "nobody@example.com"/);
   });
+
+  it("rejects path-traversal-shaped account names", async () => {
+    const dir = await tmp();
+    const a = await freshAuth(dir);
+    expect(() => a.accountPath("../x")).toThrow(/Invalid account/);
+  });
 });
 
 describe("authorize", () => {
@@ -175,6 +212,30 @@ describe("authorize", () => {
     expect(await done).toBe("amy@example.com");
     expect(JSON.parse(await readFile(path.join(dir, "accounts", "amy@example.com.json"), "utf8"))).toEqual({ refresh_token: "rt-for-good" });
     expect(await readFile(path.join(dir, "default"), "utf8")).toBe("amy@example.com\n");
+  });
+
+  it("wraps a profile lookup failure with an actionable message and writes no account file", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const { authorize } = await freshAuth(dir);
+
+    let consentUrl = "";
+    const done = authorize({
+      open: (url) => void (consentUrl = url),
+      exchange: async () => ({ refresh_token: "rt" }),
+      profile: async () => {
+        throw new Error("boom");
+      },
+    });
+    await vi.waitFor(() => expect(consentUrl).not.toBe(""));
+    const u = new URL(consentUrl);
+    const redirect = new URL(u.searchParams.get("redirect_uri")!);
+    const state = u.searchParams.get("state")!;
+    // Attach the assertion before triggering the callback so the rejection is never unhandled.
+    const rejected = expect(done).rejects.toThrow(/could not determine the account email.*boom.*gmail-mcp auth/);
+    await fetch(new URL(`/oauth2callback?code=good&state=${state}`, redirect));
+    await rejected;
+    await expect(readFile(path.join(dir, "accounts"))).rejects.toThrow(/ENOENT/);
   });
 
   it("gives up after the timeout with a message naming the fix", async () => {

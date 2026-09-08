@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { authorize, listAccounts, loadAccounts, normalizeEmail, readDefault, removeAccount, writeDefault } from "./auth.js";
+import { authorize, listAccounts, loadAccounts, normalizeEmail, readDefault, removeAccount, unknownAccountError, writeDefault } from "./auth.js";
 import { registerTools, type Accounts } from "./tools.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -91,6 +91,11 @@ export const createRequestHandler = ({ accounts, host, port, sessions = new Map(
   return { handler, sweep, allowedHosts };
 };
 
+// Loopback hosts never accept connections from off-box, so skipping request
+// authentication there doesn't expose other accounts' mail to the network.
+export const isLoopback = (host: string): boolean =>
+  host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+
 // All diagnostics go to stderr on purpose: stdout stays quiet so a process manager
 // or shell pipeline never mistakes status lines for output.
 export const cli = async (argv: string[]): Promise<boolean> => {
@@ -107,7 +112,7 @@ export const cli = async (argv: string[]): Promise<boolean> => {
   if (flag === "--default") {
     if (!value) throw new Error("Usage: gmail-mcp auth --default <email>");
     const email = normalizeEmail(value);
-    if (!(await listAccounts()).includes(email)) throw new Error(`Unknown account "${email}". Signed-in accounts: ${await known()}`);
+    if (!(await listAccounts()).includes(email)) throw unknownAccountError(email, await listAccounts());
     await writeDefault(email);
     console.error(`Default account: ${email}`);
     return true;
@@ -115,7 +120,7 @@ export const cli = async (argv: string[]): Promise<boolean> => {
   if (flag === "--remove") {
     if (!value) throw new Error("Usage: gmail-mcp auth --remove <email>");
     await removeAccount(value);
-    console.error(`Removed ${value.toLowerCase()}. Signed-in accounts: ${await known()}`);
+    console.error(`Removed ${normalizeEmail(value)}. Signed-in accounts: ${await known()}`);
     return true;
   }
   if (flag) throw new Error(`Unknown option ${flag}. Usage: gmail-mcp auth [--default <email> | --remove <email>]`);
@@ -136,6 +141,11 @@ const main = async (): Promise<void> => {
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
+  if (!isLoopback(host) && accounts.clients.size > 1) {
+    console.error(
+      `gmail-mcp: WARNING: listening on ${host} with ${accounts.clients.size} signed-in accounts and no request authentication; anyone who can reach this port can read, send, and delete mail in every account.`
+    );
+  }
   const { handler, sweep } = createRequestHandler({ accounts, host, port });
   setInterval(sweep, SESSION_IDLE_MS / 4).unref();
   createServer(handler).listen(port, host, () =>

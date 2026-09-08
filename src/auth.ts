@@ -21,14 +21,31 @@ export const SEED_TOKEN_PATH =
 
 export const ACCOUNTS_DIR =
   process.env.GMAIL_MCP_ACCOUNTS_DIR || path.join(dataDir, "gmail-mcp", "accounts");
+// A sibling of ACCOUNTS_DIR (not inside it) so an override of GMAIL_MCP_ACCOUNTS_DIR moves both
+// the account store and the default pointer together.
 export const DEFAULT_PATH = path.join(ACCOUNTS_DIR, "..", "default");
 
-export const normalizeEmail = (email: string): string => email.trim().toLowerCase();
+export const normalizeEmail = (email: string): string => {
+  const v = email.trim().toLowerCase();
+  if (v.includes("/") || v.includes("\\") || v.includes("..")) {
+    throw new Error(`Invalid account "${email}"`);
+  }
+  return v;
+};
 export const accountPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalizeEmail(email)}.json`);
 
+export const unknownAccountError = (email: string, known: string[]): Error =>
+  new Error(
+    `Unknown account "${email}". Signed-in accounts: ${known.join(", ") || "none"}. Run \`gmail-mcp auth\` to add one.`
+  );
+
+const writeSecureFile = async (file: string, contents: string): Promise<void> => {
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await fs.writeFile(file, contents, { mode: 0o600 });
+};
+
 const writeJson = async (file: string, value: unknown): Promise<void> => {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(value, null, 2), { mode: 0o600 });
+  await writeSecureFile(file, JSON.stringify(value, null, 2));
 };
 
 export const saveAccountTokens = (email: string, tokens: Auth.Credentials): Promise<void> =>
@@ -57,14 +74,13 @@ export const readDefault = async (): Promise<string | undefined> => {
 };
 
 export const writeDefault = async (email: string): Promise<void> => {
-  await fs.mkdir(path.dirname(DEFAULT_PATH), { recursive: true });
-  await fs.writeFile(DEFAULT_PATH, `${normalizeEmail(email)}\n`, { mode: 0o600 });
+  await writeSecureFile(DEFAULT_PATH, `${normalizeEmail(email)}\n`);
 };
 
 export const removeAccount = async (email: string): Promise<void> => {
   const target = normalizeEmail(email);
   const known = await listAccounts();
-  if (!known.includes(target)) throw new Error(`Unknown account "${target}". Signed-in accounts: ${known.join(", ") || "none"}`);
+  if (!known.includes(target)) throw unknownAccountError(target, known);
   await fs.rm(accountPath(target));
   if ((await readDefault()) === target) {
     const rest = known.filter((e) => e !== target);
@@ -85,6 +101,7 @@ const AUTH_TIMEOUT_MS = 5 * 60_000;
 const readJson = async (file: string): Promise<Record<string, unknown>> =>
   JSON.parse(await fs.readFile(file, "utf8"));
 
+/** Refreshed tokens are persisted back to disk only when `tokenFile` is given; otherwise refreshes update the in-memory client only. */
 export const createClient = async (redirectUri?: string, tokenFile?: string): Promise<Auth.OAuth2Client> => {
   const creds = await readJson(CREDENTIALS_PATH);
   const app = (creds.installed ?? creds.web) as { client_id?: string; client_secret?: string } | undefined;
@@ -132,11 +149,11 @@ export interface LoadAccountsOptions {
   gmailFor?: (client: Auth.OAuth2Client) => gmail_v1.Gmail;
 }
 
-/** Copy the first legacy token file into the account store. Returns the email, or undefined when none exists. */
+/** Copy the first legacy token file into the account store. Returns the email and source file, or undefined when none exists. */
 const migrateLegacy = async (
   legacyPaths: string[],
   profile: (client: Auth.OAuth2Client) => Promise<string>
-): Promise<string | undefined> => {
+): Promise<{ email: string; file: string } | undefined> => {
   for (const file of legacyPaths) {
     let tokens: Auth.Credentials;
     try {
@@ -157,7 +174,7 @@ const migrateLegacy = async (
     const email = raw.trim().toLowerCase();
     await saveAccountTokens(email, tokens);
     console.error(`gmail-mcp: migrated ${file} to ${accountPath(email)}`);
-    return email;
+    return { email, file };
   }
   return undefined;
 };
@@ -172,20 +189,32 @@ export const loadAccounts = async ({
   if (emails.length === 0) {
     const migrated = await migrateLegacy(legacyPaths, profile);
     if (!migrated) return undefined;
-    await writeDefault(migrated);
-    emails = [migrated];
+    await writeDefault(migrated.email);
+    if (migrated.file === TOKEN_PATH) {
+      await fs.rm(migrated.file, { force: true });
+      console.error(`gmail-mcp: removed legacy ${migrated.file}`);
+    }
+    emails = [migrated.email];
   }
   const clients = new Map<string, gmail_v1.Gmail>();
   for (const email of emails) {
     const file = accountPath(email);
-    const client = await createClient(undefined, file);
-    client.setCredentials((await readJson(file)) as Auth.Credentials);
-    clients.set(email, gmailFor(client));
+    try {
+      const client = await createClient(undefined, file);
+      client.setCredentials((await readJson(file)) as Auth.Credentials);
+      clients.set(email, gmailFor(client));
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      console.error(
+        `gmail-mcp: skipping ${email}: ${msg}. Run \`gmail-mcp auth\` and sign in as ${email} to repair it.`
+      );
+    }
   }
+  if (clients.size === 0) return undefined;
   let def = await readDefault();
   if (!def || !clients.has(def)) {
-    if (def) console.error(`gmail-mcp: default account ${def} is not signed in; using ${emails[0]}`);
-    def = emails[0];
+    if (def) console.error(`gmail-mcp: default account ${def} is not signed in; using ${[...clients.keys()][0]}`);
+    def = [...clients.keys()][0];
   }
   return { clients, default: def };
 };
@@ -244,9 +273,16 @@ export const authorize = async ({
     });
     const tokens = await exchange(client, code);
     client.setCredentials(tokens);
-    const email = (await profile(client)).trim().toLowerCase();
+    let raw: string;
+    try {
+      raw = await profile(client);
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      throw new Error(`Signed in, but could not determine the account email (${msg}). Retry \`gmail-mcp auth\`.`);
+    }
+    const email = raw.trim().toLowerCase();
     await saveAccountTokens(email, tokens);
-    if (!(await readDefault())) await writeDefault(email);
+    if ((await listAccounts()).length === 1) await writeDefault(email);
     console.error(`Signed in as ${email}; tokens saved to ${accountPath(email)}`);
     return email;
   } finally {
