@@ -23,8 +23,8 @@ export const ACCOUNTS_DIR =
   process.env.GMAIL_MCP_ACCOUNTS_DIR || path.join(dataDir, "gmail-mcp", "accounts");
 export const DEFAULT_PATH = path.join(ACCOUNTS_DIR, "..", "default");
 
-const normalize = (email: string): string => email.trim().toLowerCase();
-export const accountPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalize(email)}.json`);
+export const normalizeEmail = (email: string): string => email.trim().toLowerCase();
+export const accountPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalizeEmail(email)}.json`);
 
 const writeJson = async (file: string, value: unknown): Promise<void> => {
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -48,7 +48,7 @@ export const listAccounts = async (): Promise<string[]> => {
 
 export const readDefault = async (): Promise<string | undefined> => {
   try {
-    const v = normalize(await fs.readFile(DEFAULT_PATH, "utf8"));
+    const v = normalizeEmail(await fs.readFile(DEFAULT_PATH, "utf8"));
     return v || undefined;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -58,11 +58,11 @@ export const readDefault = async (): Promise<string | undefined> => {
 
 export const writeDefault = async (email: string): Promise<void> => {
   await fs.mkdir(path.dirname(DEFAULT_PATH), { recursive: true });
-  await fs.writeFile(DEFAULT_PATH, `${normalize(email)}\n`, { mode: 0o600 });
+  await fs.writeFile(DEFAULT_PATH, `${normalizeEmail(email)}\n`, { mode: 0o600 });
 };
 
 export const removeAccount = async (email: string): Promise<void> => {
-  const target = normalize(email);
+  const target = normalizeEmail(email);
   const known = await listAccounts();
   if (!known.includes(target)) throw new Error(`Unknown account "${target}". Signed-in accounts: ${known.join(", ") || "none"}`);
   await fs.rm(accountPath(target));
@@ -147,7 +147,14 @@ const migrateLegacy = async (
     }
     const client = await createClient();
     client.setCredentials(tokens);
-    const email = (await profile(client)).trim().toLowerCase();
+    let raw: string;
+    try {
+      raw = await profile(client);
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      throw new Error(`Could not migrate ${file} into the account store (${msg}). Run \`gmail-mcp auth\` to sign in.`);
+    }
+    const email = raw.trim().toLowerCase();
     await saveAccountTokens(email, tokens);
     console.error(`gmail-mcp: migrated ${file} to ${accountPath(email)}`);
     return email;

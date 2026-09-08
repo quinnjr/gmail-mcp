@@ -63,6 +63,23 @@ describe("loadAccounts", () => {
     expect(JSON.parse(await readFile(legacy, "utf8"))).toEqual({ refresh_token: "old" }); // left in place
   });
 
+  it("wraps a profile lookup failure during migration with an actionable message", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const legacy = path.join(dir, "tokens.json");
+    await writeFile(legacy, JSON.stringify({ refresh_token: "old" }));
+    const a = await freshAuth(dir);
+    await expect(
+      a.loadAccounts({
+        legacyPaths: [legacy],
+        profile: async () => {
+          throw new Error("insufficient scope");
+        },
+        gmailFor,
+      })
+    ).rejects.toThrow(/Could not migrate .*tokens\.json.*insufficient scope.*gmail-mcp auth/);
+  });
+
   it("rethrows anything other than a missing legacy file", async () => {
     const dir = await tmp();
     await writeCredentials(dir);

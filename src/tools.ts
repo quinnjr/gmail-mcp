@@ -86,7 +86,7 @@ const classification = {
 export const registerTools = (server: McpServer, accounts: Accounts): void => {
   const known = () => [...accounts.clients.keys()].sort();
   const resolve = (account?: string): { email: string; gmail: Gmail } => {
-    const email = (account ?? accounts.default).trim().toLowerCase();
+    const email = (account?.trim() || accounts.default).trim().toLowerCase();
     const gmail = accounts.clients.get(email);
     if (!gmail)
       throw new Error(`Unknown account "${email}". Signed-in accounts: ${known().join(", ")}. Run \`gmail-mcp auth\` to add one.`);
@@ -114,8 +114,8 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
       inputSchema: { account: z.string() } },
     async ({ account }) => {
       const { email } = resolve(account);
-      accounts.default = email;
       await accounts.setDefault?.(email);
+      accounts.default = email;
       return json({ default: email });
     });
 
@@ -136,10 +136,10 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     (a, gmail, call) => call(() => gmail.users.messages.list(a)));
   tool("gmail_get_message", "Get one message. format=full returns decoded, untruncated text and html bodies plus attachment metadata; raw returns the whole RFC 822 source",
     { ...ids, id: z.string(), format: fmt, metadataHeaders: z.array(z.string()).optional() },
-    async (a, gmail) => {
+    (a, gmail, call) => call(async () => {
       const { data } = await gmail.users.messages.get(a);
-      return json(a.format === "full" ? parseMessage(data) : data);
-    });
+      return { data: a.format === "full" ? parseMessage(data) : data };
+    }));
   tool("gmail_send_message", "Compose and send an email with optional attachments", { ...ids, ...composeShape },
     ({ userId, ...c }, gmail, call) => call(async () => gmail.users.messages.send({ userId, requestBody: await rawMessage(c) })));
   tool("gmail_send_raw", "Send a pre-built RFC 822 message (base64url `raw`)",
@@ -175,15 +175,15 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
   tool("gmail_get_attachment", "Download an attachment. Returns base64 data, or writes to savePath and returns the path",
     { ...ids, messageId: z.string(), id: z.string().describe("attachmentId from gmail_get_message"),
       savePath: z.string().optional().describe("Write bytes here instead of returning them") },
-    async ({ userId, messageId, id, savePath }, gmail) => {
+    ({ userId, messageId, id, savePath }, gmail, call) => call(async (): Promise<{ data: { size: number; data?: string; path?: string } }> => {
       const { data } = await gmail.users.messages.attachments.get({ userId, messageId, id });
       const bytes = Buffer.from(data.data ?? "", "base64url");
-      if (!savePath) return json({ size: bytes.byteLength, data: bytes.toString("base64") });
+      if (!savePath) return { data: { size: bytes.byteLength, data: bytes.toString("base64") } };
       const abs = path.resolve(savePath);
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, bytes);
-      return json({ size: bytes.byteLength, path: abs });
-    });
+      return { data: { size: bytes.byteLength, path: abs } };
+    }));
 
   // ---- threads ----
   tool("gmail_list_threads", "List threads matching a query",
@@ -192,12 +192,12 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     (a, gmail, call) => call(() => gmail.users.threads.list(a)));
   tool("gmail_get_thread", "Get a thread with every message fully decoded (untruncated bodies, attachment metadata)",
     { ...ids, id: z.string(), format: fmt, metadataHeaders: z.array(z.string()).optional() },
-    async (a, gmail) => {
+    (a, gmail, call) => call(async () => {
       const { data } = await gmail.users.threads.get(a);
-      return json(a.format === "full"
+      return { data: a.format === "full"
         ? { id: data.id, historyId: data.historyId, snippet: data.snippet, messages: (data.messages ?? []).map(parseMessage) }
-        : data);
-    });
+        : data };
+    }));
   tool("gmail_modify_thread", "Add/remove labels on every message in a thread",
     { ...ids, id: z.string(), addLabelIds: z.array(z.string()).optional(), removeLabelIds: z.array(z.string()).optional() },
     ({ userId, id, ...requestBody }, gmail, call) => call(() => gmail.users.threads.modify({ userId, id, requestBody })));
@@ -210,10 +210,10 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     { ...ids, q: z.string().optional(), maxResults: z.number().int().min(1).max(500).optional().describe("Defaults to the Gmail API default of 100"), pageToken: z.string().optional(), includeSpamTrash: z.boolean().optional() },
     (a, gmail, call) => call(() => gmail.users.drafts.list(a)));
   tool("gmail_get_draft", "Get a draft with its message fully decoded", { ...ids, id: z.string(), format: fmt },
-    async (a, gmail) => {
+    (a, gmail, call) => call(async () => {
       const { data } = await gmail.users.drafts.get(a);
-      return json(a.format === "full" && data.message ? { id: data.id, message: parseMessage(data.message) } : data);
-    });
+      return { data: a.format === "full" && data.message ? { id: data.id, message: parseMessage(data.message) } : data };
+    }));
   tool("gmail_create_draft", "Create a draft with optional attachments", { ...ids, ...composeShape },
     ({ userId, ...c }, gmail, call) => call(async () => gmail.users.drafts.create({ userId, requestBody: { message: await rawMessage(c) } })));
   tool("gmail_update_draft", "Replace a draft's content", { ...ids, id: z.string(), ...composeShape },

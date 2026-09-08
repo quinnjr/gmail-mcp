@@ -101,6 +101,12 @@ describe("registerTools", () => {
     expect(bob.calls.map((c) => c.path)).toEqual(["users.getProfile"]);
   });
 
+  it("treats a blank account as omitted and routes to the default account", async () => {
+    amy.calls.length = 0;
+    await invoke(tools.get("gmail_get_profile")!, { account: "  " });
+    expect(amy.calls.map((c) => c.path)).toEqual(["users.getProfile"]);
+  });
+
   it("rejects an unknown account before touching Google, listing what is signed in", async () => {
     amy.calls.length = 0;
     await expect(invoke(tools.get("gmail_get_profile")!, { account: "zed@example.com" }))
@@ -156,5 +162,13 @@ describe("registerTools", () => {
     const failing = { users: { getProfile: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })), settings: {} } } as unknown as gmail_v1.Gmail;
     const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_profile")!;
     await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
+  });
+
+  it("wraps a failing messages.get on gmail_get_message with the account and the fix", async () => {
+    const failing = {
+      users: { messages: { get: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })) }, settings: {} },
+    } as unknown as gmail_v1.Gmail;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_message")!;
+    await expect(invoke(t, { id: "m" })).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
   });
 });

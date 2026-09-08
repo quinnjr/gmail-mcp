@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { authorize, listAccounts, loadAccounts, readDefault, removeAccount, writeDefault } from "./auth.js";
+import { authorize, listAccounts, loadAccounts, normalizeEmail, readDefault, removeAccount, writeDefault } from "./auth.js";
 import { registerTools, type Accounts } from "./tools.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -93,7 +93,7 @@ export const createRequestHandler = ({ accounts, host, port, sessions = new Map(
 
 // All diagnostics go to stderr on purpose: stdout stays quiet so a process manager
 // or shell pipeline never mistakes status lines for output.
-const cli = async (argv: string[]): Promise<boolean> => {
+export const cli = async (argv: string[]): Promise<boolean> => {
   const [cmd, flag, value] = argv;
   const known = async () => (await listAccounts()).join(", ") || "none";
   if (cmd === "accounts") {
@@ -106,7 +106,7 @@ const cli = async (argv: string[]): Promise<boolean> => {
   if (cmd !== "auth") return false;
   if (flag === "--default") {
     if (!value) throw new Error("Usage: gmail-mcp auth --default <email>");
-    const email = value.toLowerCase();
+    const email = normalizeEmail(value);
     if (!(await listAccounts()).includes(email)) throw new Error(`Unknown account "${email}". Signed-in accounts: ${await known()}`);
     await writeDefault(email);
     console.error(`Default account: ${email}`);
