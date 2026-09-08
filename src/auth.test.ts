@@ -312,4 +312,47 @@ describe("authorize", () => {
     expect(await a.readAccountToken("first@example.com")).toBe("keep-me");
     log.mockRestore();
   });
+
+  it("gives up when the post-consent profile lookup never resolves", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const { authorize } = await freshAuth(dir);
+
+    let consentUrl = "";
+    const done = authorize({
+      open: (url) => void (consentUrl = url),
+      exchange: async () => ({ refresh_token: "rt" }),
+      profile: () => new Promise<string>(() => {}),
+      profileTimeoutMs: 50,
+    });
+    await vi.waitFor(() => expect(consentUrl).not.toBe(""));
+    const u = new URL(consentUrl);
+    const redirect = new URL(u.searchParams.get("redirect_uri")!);
+    const state = u.searchParams.get("state")!;
+    const rejected = expect(done).rejects.toThrow(/did not complete within.*gmail-mcp auth/);
+    await fetch(new URL(`/oauth2callback?code=good&state=${state}`, redirect));
+    await rejected;
+  });
+});
+
+describe("cachedTokenReader", () => {
+  it("reuses the cached token until the file changes, and clears the cache on removal", async () => {
+    const dir = await tmp();
+    const a = await freshAuth(dir);
+    await a.writeAccountToken("amy@example.com", "t-1");
+
+    const reader = a.cachedTokenReader();
+
+    expect(await reader("amy@example.com")).toBe("t-1");
+    expect(await reader("amy@example.com")).toBe("t-1");
+
+    // Ensure the new write lands with a different mtime/size than the cached stat.
+    await new Promise((r) => setTimeout(r, 10));
+    await a.writeAccountToken("amy@example.com", "t-2-longer");
+    expect(await reader("amy@example.com")).toBe("t-2-longer");
+
+    const { rm } = await import("node:fs/promises");
+    await rm(a.tokenPath("amy@example.com"));
+    expect(await reader("amy@example.com")).toBeUndefined();
+  });
 });

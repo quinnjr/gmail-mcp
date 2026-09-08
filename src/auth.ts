@@ -83,6 +83,33 @@ export const writeAccountToken = async (email: string, token: string): Promise<v
   await writeSecureFile(tokenPath(email), `${token}\n`);
 };
 
+/**
+ * A token reader that skips re-reading a `.token` file when its mtime and size haven't
+ * changed since the last call, so a hot per-request auth check avoids a disk read each time.
+ */
+export const cachedTokenReader = (): ((email: string) => Promise<string | undefined>) => {
+  const cache = new Map<string, { mtimeMs: number; size: number; token: string | undefined }>();
+  return async (email: string): Promise<string | undefined> => {
+    let stat: Awaited<ReturnType<typeof fs.stat>>;
+    try {
+      stat = await fs.stat(tokenPath(email));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        cache.delete(email);
+        return undefined;
+      }
+      throw err;
+    }
+    const cached = cache.get(email);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.token;
+    }
+    const token = await readAccountToken(email);
+    cache.set(email, { mtimeMs: stat.mtimeMs, size: stat.size, token });
+    return token;
+  };
+};
+
 /** The account's token, minting and persisting one when it has none. */
 const ensureToken = async (email: string, onCreate?: (path: string) => void): Promise<string> => {
   const existing = await readAccountToken(email);
@@ -97,7 +124,7 @@ export const removeAccount = async (email: string): Promise<void> => {
   const target = normalizeEmail(email);
   const known = await listAccounts();
   if (!known.includes(target)) throw unknownAccountError(target, known);
-  await fs.rm(accountPath(target));
+  await fs.rm(accountPath(target), { force: true });
   await fs.rm(tokenPath(target), { force: true });
 };
 
@@ -109,9 +136,47 @@ export const SCOPES = [
 ];
 
 const AUTH_TIMEOUT_MS = 5 * 60_000;
+/** Budget for post-consent network calls (profile lookup, token exchange) before giving up. */
+export const PROFILE_TIMEOUT_MS = 30_000;
 
 const readJson = async (file: string): Promise<Record<string, unknown>> =>
   JSON.parse(await fs.readFile(file, "utf8"));
+
+/** Rejects with a `gmail-mcp auth`-actionable message if `p` doesn't settle within `ms`. */
+const withTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} did not complete within ${ms / 1000}s; retry \`gmail-mcp auth\``)),
+      ms
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+
+/** Runs `profile(client)` (timed, so a hung request fails closed) and normalizes the result; wraps any failure with `wrap`. */
+const resolveEmail = async (
+  client: Auth.OAuth2Client,
+  profile: (client: Auth.OAuth2Client) => Promise<string>,
+  wrap: (msg: string) => string,
+  timeoutMs: number = PROFILE_TIMEOUT_MS
+): Promise<string> => {
+  let raw: string;
+  try {
+    raw = await withTimeout(profile(client), timeoutMs, "Profile lookup");
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    throw new Error(wrap(msg));
+  }
+  return normalizeEmail(raw);
+};
 
 /** Refreshed tokens are persisted back to disk only when `tokenFile` is given; otherwise refreshes update the in-memory client only. */
 export const createClient = async (redirectUri?: string, tokenFile?: string): Promise<Auth.OAuth2Client> => {
@@ -146,6 +211,8 @@ export interface AuthorizeOptions {
   /** Look up the signed-in address after consent. Defaults to Gmail's getProfile. */
   profile?: (client: Auth.OAuth2Client) => Promise<string>;
   timeoutMs?: number;
+  /** Budget for the post-consent exchange and profile lookup calls. Defaults to `PROFILE_TIMEOUT_MS`. */
+  profileTimeoutMs?: number;
 }
 
 const fetchProfileEmail = async (client: Auth.OAuth2Client): Promise<string> => {
@@ -160,12 +227,14 @@ export interface LoadAccountsOptions {
   profile?: (client: Auth.OAuth2Client) => Promise<string>;
   legacyPaths?: string[];
   gmailFor?: (client: Auth.OAuth2Client) => gmail_v1.Gmail;
+  profileTimeoutMs?: number;
 }
 
 /** Copy the first legacy token file into the account store. Returns the email and source file, or undefined when none exists. */
 const migrateLegacy = async (
   legacyPaths: string[],
-  profile: (client: Auth.OAuth2Client) => Promise<string>
+  profile: (client: Auth.OAuth2Client) => Promise<string>,
+  profileTimeoutMs: number = PROFILE_TIMEOUT_MS
 ): Promise<{ email: string; file: string } | undefined> => {
   for (const file of legacyPaths) {
     let tokens: Auth.Credentials;
@@ -177,14 +246,12 @@ const migrateLegacy = async (
     }
     const client = await createClient();
     client.setCredentials(tokens);
-    let raw: string;
-    try {
-      raw = await profile(client);
-    } catch (err) {
-      const msg = (err as Error)?.message ?? String(err);
-      throw new Error(`Could not migrate ${file} into the account store (${msg}). Run \`gmail-mcp auth\` to sign in.`);
-    }
-    const email = raw.trim().toLowerCase();
+    const email = await resolveEmail(
+      client,
+      profile,
+      (msg) => `Could not migrate ${file} into the account store (${msg}). Run \`gmail-mcp auth\` to sign in.`,
+      profileTimeoutMs
+    );
     await saveAccountTokens(email, tokens);
     console.error(`gmail-mcp: migrated ${file} to ${accountPath(email)}`);
     return { email, file };
@@ -197,10 +264,11 @@ export const loadAccounts = async ({
   profile = fetchProfileEmail,
   legacyPaths = [TOKEN_PATH, SEED_TOKEN_PATH],
   gmailFor = (auth) => google.gmail({ version: "v1", auth }),
+  profileTimeoutMs = PROFILE_TIMEOUT_MS,
 }: LoadAccountsOptions = {}): Promise<LoadedAccounts | undefined> => {
   let emails = await listAccounts();
   if (emails.length === 0) {
-    const migrated = await migrateLegacy(legacyPaths, profile);
+    const migrated = await migrateLegacy(legacyPaths, profile, profileTimeoutMs);
     if (!migrated) return undefined;
     if (migrated.file === TOKEN_PATH) {
       await fs.rm(migrated.file, { force: true });
@@ -242,6 +310,7 @@ export const authorize = async ({
   exchange = async (client, code) => (await client.getToken(code)).tokens,
   profile = fetchProfileEmail,
   timeoutMs = AUTH_TIMEOUT_MS,
+  profileTimeoutMs = PROFILE_TIMEOUT_MS,
 }: AuthorizeOptions = {}): Promise<{ email: string; token: string }> => {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -281,16 +350,14 @@ export const authorize = async ({
       });
       open(url);
     });
-    const tokens = await exchange(client, code);
+    const tokens = await withTimeout(exchange(client, code), profileTimeoutMs, "Token exchange");
     client.setCredentials(tokens);
-    let raw: string;
-    try {
-      raw = await profile(client);
-    } catch (err) {
-      const msg = (err as Error)?.message ?? String(err);
-      throw new Error(`Signed in, but could not determine the account email (${msg}). Retry \`gmail-mcp auth\`.`);
-    }
-    const email = raw.trim().toLowerCase();
+    const email = await resolveEmail(
+      client,
+      profile,
+      (msg) => `Signed in, but could not determine the account email (${msg}). Retry \`gmail-mcp auth\`.`,
+      profileTimeoutMs
+    );
     await saveAccountTokens(email, tokens);
     const token = await ensureToken(email);
     console.error(

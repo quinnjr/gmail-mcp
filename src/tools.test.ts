@@ -113,6 +113,12 @@ describe("registerTools", () => {
     expect(amy.calls.length).toBe(0);
   });
 
+  it("rejects a path-traversal-shaped account before touching Google", async () => {
+    amy.calls.length = 0;
+    await expect(invoke(tools.get("gmail_get_profile")!, { account: "../amy@example.com" })).rejects.toThrow(/Invalid account/);
+    expect(amy.calls.length).toBe(0);
+  });
+
   it.each([
     ["gmail_send_message", { to: ["a@b"], text: "hi" }, "users.messages.send", (a: any) => a.userId === "me" && typeof a.requestBody.raw === "string"],
     ["gmail_insert_message", { text: "hi", labelIds: ["INBOX"], deleted: false }, "users.messages.insert", (a: any) => a.requestBody.labelIds[0] === "INBOX" && a.deleted === false],

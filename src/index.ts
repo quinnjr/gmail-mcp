@@ -6,8 +6,8 @@ import { realpathSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
-  authorize, generateToken, listAccounts, loadAccounts, normalizeEmail, readAccountToken,
-  removeAccount, unknownAccountError, writeAccountToken, type LoadedAccount,
+  authorize, cachedTokenReader, generateToken, listAccounts, loadAccounts, normalizeEmail,
+  readAccountToken, removeAccount, unknownAccountError, writeAccountToken, type LoadedAccount,
 } from "./auth.js";
 import { registerTools } from "./tools.js";
 
@@ -45,7 +45,7 @@ export const authenticate = async (
   header: string | undefined,
   emails: Iterable<string>,
   tokenFor: (email: string) => Promise<string | undefined>
-): Promise<string | undefined> => {
+): Promise<{ email: string; digest: string } | undefined> => {
   const match = /^Bearer (\S+)$/i.exec(header ?? "");
   if (!match) return undefined;
   const candidate = digest(match[1]);
@@ -62,7 +62,7 @@ export const authenticate = async (
     }
     if (token && timingSafeEqual(candidate, digest(token))) found = email;
   }
-  return found;
+  return found ? { email: found, digest: candidate.toString("hex") } : undefined;
 };
 
 const rpcError = (res: ServerResponse, status: number, message: string, headers: Record<string, string> = {}): void => {
@@ -97,13 +97,12 @@ export const createRequestHandler = ({
       // session id from a dead one.
       const auth = req.headers.authorization;
       const authHeader = Array.isArray(auth) ? auth[0] : auth;
-      const email = await authenticate(authHeader, accounts.keys(), tokenFor);
-      if (!email) {
+      const authResult = await authenticate(authHeader, accounts.keys(), tokenFor);
+      if (!authResult) {
         rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
         return;
       }
-      // authenticate() only returns an email once its own regex matched this header.
-      const tokenDigest = digest(/^Bearer (\S+)$/i.exec(authHeader ?? "")![1]).toString("hex");
+      const { email, digest: tokenDigest } = authResult;
       const header = req.headers["mcp-session-id"];
       const sessionId = Array.isArray(header) ? header[0] : header;
       const existing = sessionId ? sessions.get(sessionId) : undefined;
@@ -122,7 +121,9 @@ export const createRequestHandler = ({
         // SSE stream opened under the old token is dropped too, and the client re-initializes.
         if (existing.digest !== tokenDigest) {
           sessions.delete(sessionId!);
-          existing.transport.close().catch(() => {});
+          existing.transport
+            .close()
+            .catch((err) => console.error("gmail-mcp: failed to close revoked session transport:", err));
           rpcError(res, 404, "Session not found");
           return;
         }
@@ -222,7 +223,7 @@ const main = async (): Promise<void> => {
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
-  const { handler, sweep } = createRequestHandler({ accounts, host, port, tokenFor: readAccountToken });
+  const { handler, sweep } = createRequestHandler({ accounts, host, port, tokenFor: cachedTokenReader() });
   setInterval(sweep, SESSION_IDLE_MS / 4).unref();
   createServer(handler).listen(port, host, () =>
     console.error(`gmail-mcp ${version} listening on http://${host}:${port}/mcp`)

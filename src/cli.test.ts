@@ -83,6 +83,7 @@ describe("cli", () => {
       /Unknown account "nobody@example.com".*amy@example.com/
     );
     await expect(cli(["token"])).rejects.toThrow(/Usage: gmail-mcp token/);
+    await expect(cli(["token", "amy@example.com", "--bogus"])).rejects.toThrow(/Unknown option --bogus.*Usage: gmail-mcp token/);
   });
 
   it("auth --default: is gone and rejects as an unknown option", async () => {

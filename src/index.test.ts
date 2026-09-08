@@ -1,4 +1,5 @@
 import { createServer, request } from "node:http";
+import { createHash } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { gmail_v1 } from "googleapis";
@@ -31,17 +32,18 @@ const initialize = { jsonrpc: "2.0", id: 1, method: "initialize",
 const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
 const as = (token: string) => ({ ...headers, authorization: `Bearer ${token}` });
 
-/** Open a session as `token` and return its id. */
-const openSession = async (token: string): Promise<string> => {
-  const res = await fetch(`${base}/mcp`, { method: "POST", headers: as(token), body: JSON.stringify(initialize) });
+/** Open a session as `token` against `baseUrl` and return its id. */
+const openSessionAt = async (baseUrl: string, token: string): Promise<string> => {
+  const res = await fetch(`${baseUrl}/mcp`, { method: "POST", headers: as(token), body: JSON.stringify(initialize) });
   expect(res.status).toBe(200);
   await res.text();
   const sid = res.headers.get("mcp-session-id")!;
   // The SDK rejects requests made before the client confirms initialization.
-  await fetch(`${base}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid },
+  await fetch(`${baseUrl}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid },
     body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
   return sid;
 };
+const openSession = (token: string): Promise<string> => openSessionAt(base, token);
 
 const rpc = async (token: string, sid: string, body: unknown): Promise<string> => {
   const res = await fetch(`${base}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid }, body: JSON.stringify(body) });
@@ -49,6 +51,7 @@ const rpc = async (token: string, sid: string, body: unknown): Promise<string> =
 };
 
 const tokenFor = async (email: string) => accounts.get(email)?.token;
+const digestOf = (token: string) => createHash("sha256").update(token).digest("hex");
 
 describe("authenticate", () => {
   it("returns undefined without a header, with a wrong scheme, or with a wrong token", async () => {
@@ -60,10 +63,10 @@ describe("authenticate", () => {
     expect(await authenticate(`Bearer  ${AMY}`, accounts.keys(), tokenFor)).toBeUndefined(); // two spaces is not the scheme grammar
   });
 
-  it("returns the email owning the token, with a case-insensitive scheme", async () => {
-    expect(await authenticate(`Bearer ${AMY}`, accounts.keys(), tokenFor)).toBe("amy@example.com");
-    expect(await authenticate(`bearer ${BOB}`, accounts.keys(), tokenFor)).toBe("bob@example.com");
-    expect(await authenticate(`BEARER ${BOB}`, accounts.keys(), tokenFor)).toBe("bob@example.com");
+  it("returns the email and token digest, with a case-insensitive scheme", async () => {
+    expect(await authenticate(`Bearer ${AMY}`, accounts.keys(), tokenFor)).toEqual({ email: "amy@example.com", digest: digestOf(AMY) });
+    expect(await authenticate(`bearer ${BOB}`, accounts.keys(), tokenFor)).toEqual({ email: "bob@example.com", digest: digestOf(BOB) });
+    expect(await authenticate(`BEARER ${BOB}`, accounts.keys(), tokenFor)).toEqual({ email: "bob@example.com", digest: digestOf(BOB) });
   });
 
   it("fails closed for one account whose token lookup throws, without blocking the others", async () => {
@@ -72,7 +75,7 @@ describe("authenticate", () => {
       if (email === "bob@example.com") throw new Error("EACCES");
       return tokenFor(email);
     };
-    expect(await authenticate(`Bearer ${AMY}`, accounts.keys(), flaky)).toBe("amy@example.com");
+    expect(await authenticate(`Bearer ${AMY}`, accounts.keys(), flaky)).toEqual({ email: "amy@example.com", digest: digestOf(AMY) });
     expect(await authenticate(`Bearer ${BOB}`, accounts.keys(), flaky)).toBeUndefined();
     expect(spy).toHaveBeenCalled();
     spy.mockRestore();
@@ -145,16 +148,7 @@ describe("request routing", () => {
     server.on("request", handler);
     const rotBase = `http://127.0.0.1:${port}`;
     try {
-      const open = async (token: string): Promise<string> => {
-        const res = await fetch(`${rotBase}/mcp`, { method: "POST", headers: as(token), body: JSON.stringify(initialize) });
-        expect(res.status).toBe(200);
-        await res.text();
-        const sid = res.headers.get("mcp-session-id")!;
-        await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid },
-          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
-        return sid;
-      };
-      const sid = await open(AMY);
+      const sid = await openSessionAt(rotBase, AMY);
       const T2 = "amy-token-2";
       tokens.set("amy@example.com", T2);
 
@@ -220,16 +214,7 @@ describe("request routing", () => {
     server.on("request", handler);
     const rotBase = `http://127.0.0.1:${port}`;
     try {
-      const openRotSession = async (token: string): Promise<string> => {
-        const res = await fetch(`${rotBase}/mcp`, { method: "POST", headers: as(token), body: JSON.stringify(initialize) });
-        expect(res.status).toBe(200);
-        await res.text();
-        const sid = res.headers.get("mcp-session-id")!;
-        await fetch(`${rotBase}/mcp`, { method: "POST", headers: { ...as(token), "mcp-session-id": sid },
-          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
-        return sid;
-      };
-      const sid = await openRotSession(AMY);
+      const sid = await openSessionAt(rotBase, AMY);
 
       const NEW_AMY = "amy-token-rotated";
       tokens.set("amy@example.com", NEW_AMY);

@@ -11,6 +11,8 @@
 - `gmail-mcp accounts` CLI command to list signed-in accounts.
 - `gmail-mcp token <email>` to print an account's bearer token on stdout, minting one if needed; `--rotate` replaces it.
 - `gmail-mcp auth --remove <email>` to remove a signed-in account and its token.
+- `gmail-mcp auth` now prints the new account's bearer token on stdout (previously stdout was always empty); everything else stays on stderr.
+- `GMAIL_MCP_ACCOUNTS_DIR` overrides the account store directory (default `$XDG_DATA_HOME/gmail-mcp/accounts`, holding `<email>.json` credentials and `<email>.token` bearer tokens).
 - Automatic migration of an existing `tokens.json` and the google-mcp seed into the new multi-account store.
 
 ### Breaking
@@ -18,7 +20,7 @@
 For library consumers:
 
 - `loadTokens` has been removed in favour of `loadAccounts`.
-- `registerTools(server, accounts)` now takes an `Accounts` map instead of a single Gmail client.
+- `registerTools(server, accounts)` now takes an `Accounts` object, `{ clients: Map<string, Gmail>; default: string }`, instead of a single Gmail client.
 - `HandlerOptions.gmail` has been renamed to `HandlerOptions.accounts`, now a `Map<string, { gmail, token }>`.
 - `loadAccounts` returns `{ accounts: Map<string, { gmail, token }> }`; there is no default account.
 - The default-account machinery never shipped and is gone: no `gmail_set_default_account`, no `gmail-mcp auth --default`, no `readDefault`/`writeDefault`/`Accounts.setDefault`, no `default` marker file.
