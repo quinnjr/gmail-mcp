@@ -1,6 +1,6 @@
 {
   "name": "@quinnjr/gmail-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Streamable HTTP MCP server covering the full Gmail API v1 surface",
   "type": "module",
   "main": "dist/index.js",
