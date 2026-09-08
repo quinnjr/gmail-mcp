@@ -19,6 +19,60 @@ export const TOKEN_PATH =
 export const SEED_TOKEN_PATH =
   process.env.GMAIL_MCP_SEED_TOKENS || path.join(dataDir, "google-mcp", "tokens.json");
 
+export const ACCOUNTS_DIR =
+  process.env.GMAIL_MCP_ACCOUNTS_DIR || path.join(dataDir, "gmail-mcp", "accounts");
+export const DEFAULT_PATH = path.join(ACCOUNTS_DIR, "..", "default");
+
+const normalize = (email: string): string => email.trim().toLowerCase();
+export const accountPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalize(email)}.json`);
+
+const writeJson = async (file: string, value: unknown): Promise<void> => {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(value, null, 2), { mode: 0o600 });
+};
+
+export const saveAccountTokens = (email: string, tokens: Auth.Credentials): Promise<void> =>
+  writeJson(accountPath(email), tokens);
+
+export const listAccounts = async (): Promise<string[]> => {
+  try {
+    return (await fs.readdir(ACCOUNTS_DIR))
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => f.slice(0, -".json".length))
+      .sort();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+};
+
+export const readDefault = async (): Promise<string | undefined> => {
+  try {
+    const v = normalize(await fs.readFile(DEFAULT_PATH, "utf8"));
+    return v || undefined;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+};
+
+export const writeDefault = async (email: string): Promise<void> => {
+  await fs.mkdir(path.dirname(DEFAULT_PATH), { recursive: true });
+  await fs.writeFile(DEFAULT_PATH, `${normalize(email)}\n`, { mode: 0o600 });
+};
+
+export const removeAccount = async (email: string): Promise<void> => {
+  const target = normalize(email);
+  const known = await listAccounts();
+  if (!known.includes(target)) throw new Error(`Unknown account "${target}". Signed-in accounts: ${known.join(", ") || "none"}`);
+  await fs.rm(accountPath(target));
+  if ((await readDefault()) === target) {
+    const rest = known.filter((e) => e !== target);
+    if (rest.length) await writeDefault(rest[0]);
+    else await fs.rm(DEFAULT_PATH, { force: true });
+  }
+};
+
 // Full mailbox (needed for messages.delete / batchDelete / insert / import) plus settings.
 export const SCOPES = [
   "https://mail.google.com/",
@@ -31,12 +85,7 @@ const AUTH_TIMEOUT_MS = 5 * 60_000;
 const readJson = async (file: string): Promise<Record<string, unknown>> =>
   JSON.parse(await fs.readFile(file, "utf8"));
 
-const saveTokens = async (tokens: Auth.Credentials): Promise<void> => {
-  await fs.mkdir(path.dirname(TOKEN_PATH), { recursive: true });
-  await fs.writeFile(TOKEN_PATH, JSON.stringify(tokens, null, 2), { mode: 0o600 });
-};
-
-export const createClient = async (redirectUri?: string): Promise<Auth.OAuth2Client> => {
+export const createClient = async (redirectUri?: string, tokenFile?: string): Promise<Auth.OAuth2Client> => {
   const creds = await readJson(CREDENTIALS_PATH);
   const app = (creds.installed ?? creds.web) as { client_id?: string; client_secret?: string } | undefined;
   if (!app?.client_id || !app.client_secret) {
@@ -46,15 +95,17 @@ export const createClient = async (redirectUri?: string): Promise<Auth.OAuth2Cli
     );
   }
   const client = new google.auth.OAuth2(app.client_id, app.client_secret, redirectUri);
-  // Refreshes emit only the new access token; keep the refresh token alongside it.
-  client.on("tokens", (t) => {
-    saveTokens({ ...client.credentials, ...t }).catch((err) =>
-      console.error(
-        `gmail-mcp: could not write refreshed tokens to ${TOKEN_PATH} (${err}). ` +
-          "This process keeps working; if auth fails after a restart, run `gmail-mcp auth`."
-      )
-    );
-  });
+  if (tokenFile) {
+    // Refreshes emit only the new access token; keep the refresh token alongside it.
+    client.on("tokens", (t) => {
+      writeJson(tokenFile, { ...client.credentials, ...t }).catch((err) =>
+        console.error(
+          `gmail-mcp: could not write refreshed tokens to ${tokenFile} (${err}). ` +
+            "This process keeps working; if auth fails after a restart, run `gmail-mcp auth`."
+        )
+      );
+    });
+  }
   return client;
 };
 
@@ -133,7 +184,7 @@ export const authorize = async ({
       });
       open(url);
     });
-    await saveTokens(await exchange(client, code));
+    await writeJson(TOKEN_PATH, await exchange(client, code));
     console.error(`Tokens saved to ${TOKEN_PATH}`);
   } finally {
     server.close();

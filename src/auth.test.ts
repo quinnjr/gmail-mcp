@@ -15,6 +15,7 @@ const freshAuth = async (dir: string) => {
   vi.resetModules();
   vi.stubEnv("GMAIL_MCP_CREDENTIALS", path.join(dir, "credentials.json"));
   vi.stubEnv("GMAIL_MCP_TOKENS", path.join(dir, "tokens.json"));
+  vi.stubEnv("GMAIL_MCP_ACCOUNTS_DIR", path.join(dir, "accounts"));
   return import("./auth.js");
 };
 const writeCredentials = (dir: string) =>
@@ -59,20 +60,53 @@ describe("createClient", () => {
     await expect(createClient()).rejects.toThrow(/credentials\.json is not an OAuth client file.*client_id/);
   });
 
-  it("persists refreshed tokens merged with the existing refresh token", async () => {
+  it("persists refreshed tokens to the given file, merged with the existing refresh token", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const { createClient } = await freshAuth(dir);
-    const c = await createClient();
+    const file = path.join(dir, "accounts", "amy@example.com.json");
+    const c = await createClient(undefined, file);
     c.setCredentials({ refresh_token: "keep-me", access_token: "old" });
     c.emit("tokens", { access_token: "new", expiry_date: 123 });
     await vi.waitFor(async () =>
-      expect(JSON.parse(await readFile(path.join(dir, "tokens.json"), "utf8"))).toEqual({
-        refresh_token: "keep-me",
-        access_token: "new",
-        expiry_date: 123,
-      })
+      expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ refresh_token: "keep-me", access_token: "new", expiry_date: 123 })
     );
+  });
+});
+
+describe("account store", () => {
+  it("saves under the lower-cased email, lists sorted, and reads/writes the default", async () => {
+    const dir = await tmp();
+    const a = await freshAuth(dir);
+    expect(await a.listAccounts()).toEqual([]);
+    expect(await a.readDefault()).toBeUndefined();
+
+    await a.saveAccountTokens("Zed@Example.com", { refresh_token: "z" });
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    expect(a.accountPath("Zed@Example.com")).toBe(path.join(dir, "accounts", "zed@example.com.json"));
+    expect(JSON.parse(await readFile(a.accountPath("zed@example.com"), "utf8"))).toEqual({ refresh_token: "z" });
+    expect(await a.listAccounts()).toEqual(["amy@example.com", "zed@example.com"]);
+
+    await a.writeDefault("Zed@Example.com");
+    expect(await a.readDefault()).toBe("zed@example.com");
+  });
+
+  it("removeAccount deletes the file and repoints or clears the default", async () => {
+    const dir = await tmp();
+    const a = await freshAuth(dir);
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await a.saveAccountTokens("bob@example.com", { refresh_token: "b" });
+    await a.writeDefault("amy@example.com");
+
+    await a.removeAccount("amy@example.com");
+    expect(await a.listAccounts()).toEqual(["bob@example.com"]);
+    expect(await a.readDefault()).toBe("bob@example.com");
+
+    await a.removeAccount("bob@example.com");
+    expect(await a.listAccounts()).toEqual([]);
+    expect(await a.readDefault()).toBeUndefined();
+
+    await expect(a.removeAccount("nobody@example.com")).rejects.toThrow(/Unknown account "nobody@example.com"/);
   });
 });
 
