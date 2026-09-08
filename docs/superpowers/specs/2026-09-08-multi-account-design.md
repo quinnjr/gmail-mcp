@@ -122,3 +122,55 @@ mailbox to re-authorize: `Gmail authorization for a@x expired … Run \`gmail-mc
 Single-account installs see no behavioural change: the legacy token is migrated
 silently, `account` is optional, and every tool's other inputs are unchanged.
 The `--version` bump is minor (0.2.0).
+
+## Per-account authentication (supersedes the default-account model)
+
+Owner decision, 2026-09-08: every request to `/mcp` must carry a bearer token,
+each token maps to exactly one signed-in Gmail account, and a request may only
+act on that account. This replaces the "default account" concept described
+above — the `default` marker file, `readDefault`/`writeDefault`,
+`Accounts.setDefault`, `gmail_set_default_account`, `gmail-mcp auth --default`,
+and the `*` marker in `gmail-mcp accounts` are all removed, as is `isLoopback`
+and the multi-account startup warning (authentication makes them moot). The
+tool count drops from 82 to 81.
+
+### Token store
+
+Each signed-in account gets a secret of 32 random bytes, base64url encoded,
+stored at `ACCOUNTS_DIR/<email>.token` (one line, mode 0o600, directory 0o700).
+`listAccounts` still filters on `.json`, so `.token` files never appear as
+accounts. `authorize` mints one after saving credentials when the account has
+none (a re-authorization keeps the existing token) and resolves
+`{ email, token }`; `loadAccounts` mints one for any account missing it and
+returns `{ accounts: Map<email, { gmail, token }> }`; `removeAccount` deletes
+both files.
+
+### Request handling
+
+`authenticate(header, accounts)` parses `Bearer <token>` (case-insensitive
+scheme, single space) and returns the owning email, comparing
+`sha256(candidate)` against `sha256(stored)` with `crypto.timingSafeEqual` for
+every stored token. The handler order is: path check → `authenticate` →
+session lookup → session/account match. Authentication runs *before* the
+session lookup so an unauthenticated probe cannot distinguish a live session id
+from a dead one.
+
+- No or invalid token → HTTP 401, header `WWW-Authenticate: Bearer`, body
+  `{ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }`.
+- Valid token that does not own the presented `mcp-session-id` → HTTP 403 with
+  the same shape and message `"Forbidden"`.
+
+A new session registers tools with only its own account
+(`{ clients: new Map([[email, gmail]]), default: email }`) and records `email`
+on the session, so `gmail_list_accounts` and the optional `account` input can
+only ever reach the caller's mailbox. `Accounts.default` survives purely as the
+email the session is bound to, for the omitted-`account` case.
+
+### CLI
+
+- `gmail-mcp accounts` lists emails, with no marker.
+- `gmail-mcp token <email>` prints that account's token on stdout, minting one
+  if missing; `--rotate` generates, stores, and prints a new one. An unknown
+  email raises `unknownAccountError`.
+- `gmail-mcp auth` prints the account's token on stdout; every other line of
+  output, here and everywhere else, goes to stderr.
