@@ -3,6 +3,7 @@ import type { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/m
 import type { gmail_v1 } from "googleapis";
 import { z } from "zod";
 import { registerTools } from "./tools.js";
+import type { Accounts } from "./tools.js";
 
 // Records `users.messages.send` style paths and the single argument each call received.
 const recordingGmail = () => {
@@ -19,13 +20,13 @@ const recordingGmail = () => {
 };
 
 type Registered = { shape: z.ZodRawShape; handler: ToolCallback<z.ZodRawShape> };
-const collect = (gmail: gmail_v1.Gmail) => {
+const collect = (accounts: Accounts) => {
   const tools = new Map<string, Registered>();
   const server = {
     registerTool: (name: string, config: { inputSchema: z.ZodRawShape }, handler: ToolCallback<z.ZodRawShape>) =>
       tools.set(name, { shape: config.inputSchema, handler }),
   } as unknown as McpServer;
-  registerTools(server, gmail);
+  registerTools(server, accounts);
   return tools;
 };
 
@@ -55,21 +56,67 @@ const invoke = async (t: Registered, args: Record<string, unknown>) =>
   t.handler(z.object(t.shape).parse(args), {} as never);
 
 describe("registerTools", () => {
-  const { gmail, calls } = recordingGmail();
-  const tools = collect(gmail);
+  const amy = recordingGmail();
+  const bob = recordingGmail();
+  const accounts: Accounts = {
+    clients: new Map([["amy@example.com", amy.gmail], ["bob@example.com", bob.gmail]]),
+    default: "amy@example.com",
+  };
+  const tools = collect(accounts);
+  const accountTools = new Set(["gmail_list_accounts"]);
 
-  it("registers all 80 users.* endpoints", () => {
-    expect(tools.size).toBe(80);
+  it("registers all 80 users.* endpoints plus 1 account tool", () => {
+    expect(tools.size).toBe(81);
+    expect(tools.has("gmail_set_default_account")).toBe(false);
   });
 
   it("every tool reaches exactly one googleapis method with its required input and returns JSON text", async () => {
     for (const [name, t] of tools) {
-      calls.length = 0;
+      if (accountTools.has(name)) continue;
+      amy.calls.length = 0;
       const result = await invoke(t, fill(t.shape));
-      expect(calls, name).toHaveLength(1);
-      expect(calls[0].path, name).toMatch(/^users\./);
+      expect(amy.calls, name).toHaveLength(1);
+      expect(amy.calls[0].path, name).toMatch(/^users\./);
       expect(() => JSON.parse((result.content[0] as { text: string }).text), name).not.toThrow();
     }
+  });
+
+  it("every Gmail tool accepts an optional account and, when omitted, calls the default account's client", async () => {
+    for (const [name, t] of tools) {
+      if (accountTools.has(name)) continue;
+      expect(t.shape.account, name).toBeDefined();
+      amy.calls.length = 0;
+      bob.calls.length = 0;
+      await invoke(t, fill(t.shape));
+      expect(amy.calls.length, name).toBe(1);
+      expect(bob.calls.length, name).toBe(0);
+      expect(amy.calls[0].args, name).not.toHaveProperty("account");
+    }
+  });
+
+  it("routes to the named account, case-insensitively", async () => {
+    bob.calls.length = 0;
+    await invoke(tools.get("gmail_get_profile")!, { account: "Bob@Example.com" });
+    expect(bob.calls.map((c) => c.path)).toEqual(["users.getProfile"]);
+  });
+
+  it("treats a blank account as omitted and routes to the default account", async () => {
+    amy.calls.length = 0;
+    await invoke(tools.get("gmail_get_profile")!, { account: "  " });
+    expect(amy.calls.map((c) => c.path)).toEqual(["users.getProfile"]);
+  });
+
+  it("rejects an unknown account before touching Google, listing what is signed in", async () => {
+    amy.calls.length = 0;
+    await expect(invoke(tools.get("gmail_get_profile")!, { account: "zed@example.com" }))
+      .rejects.toThrow(/Unknown account "zed@example.com".*amy@example.com, bob@example.com.*gmail-mcp auth/);
+    expect(amy.calls.length).toBe(0);
+  });
+
+  it("rejects a path-traversal-shaped account before touching Google", async () => {
+    amy.calls.length = 0;
+    await expect(invoke(tools.get("gmail_get_profile")!, { account: "../amy@example.com" })).rejects.toThrow(/Invalid account/);
+    expect(amy.calls.length).toBe(0);
   });
 
   it.each([
@@ -84,10 +131,10 @@ describe("registerTools", () => {
     ["gmail_enable_cse_keypair", { keyPairId: "k" }, "users.settings.cse.keypairs.enable", (a: any) => a.keyPairId === "k" && typeof a.requestBody === "object"],
     ["gmail_watch", { topicName: "projects/p/topics/t" }, "users.watch", (a: any) => a.requestBody.topicName.endsWith("/t")],
   ])("%s places its parameters where googleapis expects", async (name, args, path, check) => {
-    calls.length = 0;
+    amy.calls.length = 0;
     await invoke(tools.get(name)!, args);
-    expect(calls[0].path).toBe(path);
-    expect(check(calls[0].args)).toBe(true);
+    expect(amy.calls[0].path).toBe(path);
+    expect(check(amy.calls[0].args)).toBe(true);
   });
 
   it("gmail_get_message decodes format=full and passes other formats through", async () => {
@@ -102,9 +149,32 @@ describe("registerTools", () => {
     expect(JSON.parse((r.content[0] as { text: string }).text)).toEqual({ size: 5, data: Buffer.from("bytes").toString("base64") });
   });
 
-  it("wraps Google auth errors with the command that fixes them", async () => {
+  it("gmail_list_accounts reports the signed-in accounts and the bound one", async () => {
+    const list = await invoke(tools.get("gmail_list_accounts")!, {});
+    expect(JSON.parse((list.content[0] as { text: string }).text)).toEqual({ accounts: ["amy@example.com", "bob@example.com"], default: "amy@example.com" });
+  });
+
+  it("wraps Google auth errors with the account and the command that fixes them", async () => {
     const failing = { users: { getProfile: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })), settings: {} } } as unknown as gmail_v1.Gmail;
-    const t = collect(failing).get("gmail_get_profile")!;
-    await expect(invoke(t, {})).rejects.toThrow(/gmail-mcp auth/);
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_profile")!;
+    await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
+  });
+
+  it("wraps a 403 insufficient-scope error on gmail_get_profile with the account and the fix", async () => {
+    const failing = {
+      users: { getProfile: () => Promise.reject(Object.assign(new Error("insufficient scope"), { code: 403 })), settings: {} },
+    } as unknown as gmail_v1.Gmail;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_profile")!;
+    // explain()'s 403-scope message puts the raw Google error last, after the `gmail-mcp auth` fix
+    // instruction, so this checks the account + fix + raw error text in the order they actually appear.
+    await expect(invoke(t, {})).rejects.toThrow(/amy@example\.com.*gmail-mcp auth.*insufficient scope/);
+  });
+
+  it("wraps a failing messages.get on gmail_get_message with the account and the fix", async () => {
+    const failing = {
+      users: { messages: { get: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })) }, settings: {} },
+    } as unknown as gmail_v1.Gmail;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_message")!;
+    await expect(invoke(t, { id: "m" })).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
   });
 });
