@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { authorize, listAccounts, loadAccounts, normalizeEmail, readDefault, removeAccount, unknownAccountError, writeDefault } from "./auth.js";
-import { registerTools, type Accounts } from "./tools.js";
+import {
+  authorize, generateToken, listAccounts, loadAccounts, normalizeEmail, readAccountToken,
+  removeAccount, unknownAccountError, writeAccountToken, type LoadedAccount,
+} from "./auth.js";
+import { registerTools } from "./tools.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
 
@@ -16,14 +19,39 @@ const SESSION_IDLE_MS = 60 * 60_000;
 interface Session {
   transport: StreamableHTTPServerTransport;
   lastSeen: number;
+  /** The account whose bearer token opened this session; no other token may use it. */
+  email: string;
 }
 
 export interface HandlerOptions {
-  accounts: Accounts;
+  accounts: Map<string, LoadedAccount>;
   host: string;
   port: number;
   sessions?: Map<string, Session>;
 }
+
+const digest = (v: string): Buffer => createHash("sha256").update(v).digest();
+
+/**
+ * The email owning the bearer token in `header`, or undefined. Hashing both sides keeps the
+ * comparison constant time (timingSafeEqual needs equal lengths) and hides token length.
+ */
+export const authenticate = (header: string | undefined, accounts: HandlerOptions["accounts"]): string | undefined => {
+  const match = /^Bearer (\S+)$/i.exec(header ?? "");
+  if (!match) return undefined;
+  const candidate = digest(match[1]);
+  let found: string | undefined;
+  for (const [email, account] of accounts) {
+    if (timingSafeEqual(candidate, digest(account.token))) found = email;
+  }
+  return found;
+};
+
+const rpcError = (res: ServerResponse, status: number, message: string, headers: Record<string, string> = {}): void => {
+  res
+    .writeHead(status, { "content-type": "application/json", ...headers })
+    .end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message }, id: null }));
+};
 
 /**
  * Streamable HTTP only, at /mcp. One McpServer per session (the SDK requires 1:1
@@ -41,15 +69,26 @@ export const createRequestHandler = ({ accounts, host, port, sessions = new Map(
       return;
     }
     try {
+      // Authenticate before the session lookup so an unauthenticated probe cannot tell a live
+      // session id from a dead one.
+      const auth = req.headers.authorization;
+      const email = authenticate(Array.isArray(auth) ? auth[0] : auth, accounts);
+      if (!email) {
+        rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
+        return;
+      }
       const header = req.headers["mcp-session-id"];
       const sessionId = Array.isArray(header) ? header[0] : header;
       const existing = sessionId ? sessions.get(sessionId) : undefined;
       if (sessionId && !existing) {
-        res.writeHead(404, { "content-type": "application/json" })
-          .end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }));
+        rpcError(res, 404, "Session not found");
         return;
       }
       if (existing) {
+        if (existing.email !== email) {
+          rpcError(res, 403, "Forbidden");
+          return;
+        }
         existing.lastSeen = Date.now();
         await existing.transport.handleRequest(req, res);
         return;
@@ -63,12 +102,13 @@ export const createRequestHandler = ({ accounts, host, port, sessions = new Map(
         enableDnsRebindingProtection: true,
         allowedHosts,
         onsessioninitialized: (id: string) => {
-          sessions.set(id, { transport, lastSeen: Date.now() });
+          sessions.set(id, { transport, lastSeen: Date.now(), email });
         },
       });
       transport.onclose = () => transport.sessionId && sessions.delete(transport.sessionId);
       const server = new McpServer({ name: "gmail-mcp", version });
-      registerTools(server, accounts);
+      // The token binds the session to exactly one account, so that is all the session can see.
+      registerTools(server, { clients: new Map([[email, accounts.get(email)!.gmail]]), default: email });
       await server.connect(transport);
       await transport.handleRequest(req, res);
     } catch (err) {
@@ -91,39 +131,38 @@ export const createRequestHandler = ({ accounts, host, port, sessions = new Map(
   return { handler, sweep, allowedHosts };
 };
 
-// Loopback hosts never accept connections from off-box, so skipping request
-// authentication there doesn't expose other accounts' mail to the network.
-export const isLoopback = (host: string): boolean =>
-  host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
-
-// All diagnostics go to stderr on purpose: stdout stays quiet so a process manager
-// or shell pipeline never mistakes status lines for output.
+// All diagnostics go to stderr on purpose: only bearer tokens go to stdout, so
+// `gmail-mcp token <email>` can be piped straight into a client config.
 export const cli = async (argv: string[]): Promise<boolean> => {
   const [cmd, flag, value] = argv;
   const known = async () => (await listAccounts()).join(", ") || "none";
   if (cmd === "accounts") {
-    const def = await readDefault();
     const all = await listAccounts();
     if (all.length === 0) console.error("No accounts. Run: gmail-mcp auth");
-    for (const e of all) console.error(`${e === def ? "*" : " "} ${e}`);
+    for (const e of all) console.error(e);
+    return true;
+  }
+  if (cmd === "token") {
+    if (!flag) throw new Error("Usage: gmail-mcp token <email> [--rotate]");
+    const email = normalizeEmail(flag);
+    const all = await listAccounts();
+    if (!all.includes(email)) throw unknownAccountError(email, all);
+    if (value && value !== "--rotate") throw new Error(`Unknown option ${value}. Usage: gmail-mcp token <email> [--rotate]`);
+    const rotate = value === "--rotate";
+    const token = (!rotate && (await readAccountToken(email))) || generateToken();
+    await writeAccountToken(email, token);
+    console.error(`Bearer token for ${email}${rotate ? " (rotated; existing clients must be updated)" : ""}:`);
+    console.log(token);
     return true;
   }
   if (cmd !== "auth") return false;
-  if (flag === "--default") {
-    if (!value) throw new Error("Usage: gmail-mcp auth --default <email>");
-    const email = normalizeEmail(value);
-    if (!(await listAccounts()).includes(email)) throw unknownAccountError(email, await listAccounts());
-    await writeDefault(email);
-    console.error(`Default account: ${email}`);
-    return true;
-  }
   if (flag === "--remove") {
     if (!value) throw new Error("Usage: gmail-mcp auth --remove <email>");
     await removeAccount(value);
     console.error(`Removed ${normalizeEmail(value)}. Signed-in accounts: ${await known()}`);
     return true;
   }
-  if (flag) throw new Error(`Unknown option ${flag}. Usage: gmail-mcp auth [--default <email> | --remove <email>]`);
+  if (flag) throw new Error(`Unknown option ${flag}. Usage: gmail-mcp auth [--remove <email>]`);
   await authorize();
   return true;
 };
@@ -136,16 +175,14 @@ const main = async (): Promise<void> => {
     console.error("No accounts. Run: gmail-mcp auth");
     process.exit(1);
   }
-  const accounts: Accounts = { ...loaded, setDefault: writeDefault };
-  console.error(`gmail-mcp accounts: ${[...accounts.clients.keys()].join(", ")} (default ${accounts.default})`);
+  const { accounts } = loaded;
+  console.error(
+    `gmail-mcp accounts: ${[...accounts.keys()].join(", ")}. ` +
+      "Every /mcp request needs `Authorization: Bearer <token>`; print one with `gmail-mcp token <email>`."
+  );
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
-  if (!isLoopback(host) && accounts.clients.size > 1) {
-    console.error(
-      `gmail-mcp: WARNING: listening on ${host} with ${accounts.clients.size} signed-in accounts and no request authentication; anyone who can reach this port can read, send, and delete mail in every account.`
-    );
-  }
   const { handler, sweep } = createRequestHandler({ accounts, host, port });
   setInterval(sweep, SESSION_IDLE_MS / 4).unref();
   createServer(handler).listen(port, host, () =>

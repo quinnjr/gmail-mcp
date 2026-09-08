@@ -29,53 +29,79 @@ describe("cli", () => {
     }
   });
 
-  it("accounts: lists signed-in accounts, marking the default", async () => {
+  it("accounts: lists signed-in accounts with no default marker", async () => {
     const dir = await tmp();
-    const { cli, saveAccountTokens, writeDefault } = await freshCli(dir);
+    const { cli, saveAccountTokens } = await freshCli(dir);
     await saveAccountTokens("amy@example.com", { refresh_token: "a" });
     await saveAccountTokens("bob@example.com", { refresh_token: "b" });
-    await writeDefault("bob@example.com");
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await expect(cli(["accounts"])).resolves.toBe(true);
       const out = spy.mock.calls.map((c) => c.join(" ")).join("\n");
-      expect(out).toContain("  amy@example.com");
-      expect(out).toContain("* bob@example.com");
+      expect(out).toContain("amy@example.com");
+      expect(out).toContain("bob@example.com");
+      expect(out).not.toContain("*");
     } finally {
       spy.mockRestore();
     }
   });
 
-  it("auth --default: sets the default (normalized) or rejects an unknown account or missing value", async () => {
+  it("token: prints the account's token on stdout, minting one when missing", async () => {
     const dir = await tmp();
-    const { cli, saveAccountTokens, readDefault } = await freshCli(dir);
+    const { cli, saveAccountTokens, readAccountToken } = await freshCli(dir);
     await saveAccountTokens("amy@example.com", { refresh_token: "a" });
-    await saveAccountTokens("bob@example.com", { refresh_token: "b" });
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await expect(cli(["auth", "--default", "Amy@Example.com"])).resolves.toBe(true);
-      expect(await readDefault()).toBe("amy@example.com");
+      await expect(cli(["token", "Amy@Example.com"])).resolves.toBe(true);
+      const minted = await readAccountToken("amy@example.com");
+      expect(minted).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(log.mock.calls.flat()).toEqual([minted]);
 
-      await expect(cli(["auth", "--default", "nobody@example.com"])).rejects.toThrow(
-        /Unknown account "nobody@example.com".*amy@example.com, bob@example.com/
-      );
-      await expect(cli(["auth", "--default"])).rejects.toThrow(/Usage: gmail-mcp auth --default/);
+      // A second call is stable.
+      log.mockClear();
+      await cli(["token", "amy@example.com"]);
+      expect(log.mock.calls.flat()).toEqual([minted]);
+
+      // --rotate replaces it.
+      log.mockClear();
+      await expect(cli(["token", "amy@example.com", "--rotate"])).resolves.toBe(true);
+      const rotated = await readAccountToken("amy@example.com");
+      expect(rotated).not.toBe(minted);
+      expect(log.mock.calls.flat()).toEqual([rotated]);
     } finally {
-      spy.mockRestore();
+      log.mockRestore();
+      err.mockRestore();
     }
   });
 
-  it("auth --remove: removes an account and repoints the default, or rejects with no value", async () => {
+  it("token: rejects an unknown account or a missing email", async () => {
     const dir = await tmp();
-    const { cli, saveAccountTokens, writeDefault, readDefault, listAccounts } = await freshCli(dir);
+    const { cli, saveAccountTokens } = await freshCli(dir);
+    await saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await expect(cli(["token", "nobody@example.com"])).rejects.toThrow(
+      /Unknown account "nobody@example.com".*amy@example.com/
+    );
+    await expect(cli(["token"])).rejects.toThrow(/Usage: gmail-mcp token/);
+  });
+
+  it("auth --default: is gone and rejects as an unknown option", async () => {
+    const dir = await tmp();
+    const { cli } = await freshCli(dir);
+    await expect(cli(["auth", "--default", "amy@example.com"])).rejects.toThrow(/Unknown option --default/);
+  });
+
+  it("auth --remove: removes an account and its token, or rejects with no value", async () => {
+    const dir = await tmp();
+    const { cli, saveAccountTokens, writeAccountToken, readAccountToken, listAccounts } = await freshCli(dir);
     await saveAccountTokens("amy@example.com", { refresh_token: "a" });
     await saveAccountTokens("bob@example.com", { refresh_token: "b" });
-    await writeDefault("bob@example.com");
+    await writeAccountToken("bob@example.com", "bob-token");
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await expect(cli(["auth", "--remove", "bob@example.com"])).resolves.toBe(true);
       expect(await listAccounts()).toEqual(["amy@example.com"]);
-      expect(await readDefault()).toBe("amy@example.com");
+      expect(await readAccountToken("bob@example.com")).toBeUndefined();
 
       await expect(cli(["auth", "--remove"])).rejects.toThrow(/Usage: gmail-mcp auth --remove/);
     } finally {
