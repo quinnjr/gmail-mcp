@@ -1,2 +1,16 @@
 allowBuilds:
   esbuild: true
+minimumReleaseAgeExclude:
+  - '@napi-rs/keyring-darwin-arm64@2.1.0'
+  - '@napi-rs/keyring-darwin-x64@2.1.0'
+  - '@napi-rs/keyring-freebsd-x64@2.1.0'
+  - '@napi-rs/keyring-linux-arm-gnueabihf@2.1.0'
+  - '@napi-rs/keyring-linux-arm64-gnu@2.1.0'
+  - '@napi-rs/keyring-linux-arm64-musl@2.1.0'
+  - '@napi-rs/keyring-linux-riscv64-gnu@2.1.0'
+  - '@napi-rs/keyring-linux-x64-gnu@2.1.0'
+  - '@napi-rs/keyring-linux-x64-musl@2.1.0'
+  - '@napi-rs/keyring-win32-arm64-msvc@2.1.0'
+  - '@napi-rs/keyring-win32-ia32-msvc@2.1.0'
+  - '@napi-rs/keyring-win32-x64-msvc@2.1.0'
+  - '@napi-rs/keyring@2.1.0'
