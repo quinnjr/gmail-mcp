@@ -3,9 +3,11 @@ import path from "node:path";
 
 /** Every secret lives under one keyring service so `findCredentials` can enumerate it. */
 export const SERVICE = "gmail-mcp";
-const CLIENT = "client";
-// Windows generic credentials cap the blob at 5 * 512 bytes.
+/** The OAuth client (app) secret. Owned here because the file layout maps it too. */
+export const CLIENT_KEY = "client";
+// Windows generic credentials cap the blob at 5 * 512 bytes, measured over UTF-16.
 const WIN32_MAX_BLOB_BYTES = 2560;
+const PROBE_KEY = "__gmail_mcp_probe__";
 
 export type StoreKind = "keyring" | "file" | "memory";
 
@@ -24,13 +26,18 @@ export interface SecretStore {
   describe(key: string): string;
 }
 
+/** Rejects account names that could escape a path. The one validator, shared by auth. */
+export const assertValidAccount = (email: string): void => {
+  if (email.includes("/") || email.includes("\\") || email.includes("..")) {
+    throw new Error(`Invalid account "${email}"`);
+  }
+};
+
 const accountOf = (key: string, kind: "oauth" | "bearer"): string => {
   const prefix = `${kind}:`;
   if (!key.startsWith(prefix)) throw new Error(`Unknown secret key "${key}"`);
   const email = key.slice(prefix.length);
-  if (email.includes("/") || email.includes("\\") || email.includes("..")) {
-    throw new Error(`Invalid account "${email}"`);
-  }
+  assertValidAccount(email);
   return email;
 };
 
@@ -44,7 +51,7 @@ export interface FileStoreOptions {
 /** The pre-keyring layout: 0700 directory, 0600 files, repaired on every write. */
 export const fileStore = ({ dir, clientPath }: FileStoreOptions): SecretStore => {
   const fileFor = (key: string): string => {
-    if (key === CLIENT) return clientPath;
+    if (key === CLIENT_KEY) return clientPath;
     if (key.startsWith("oauth:")) return path.join(dir, `${accountOf(key, "oauth")}.json`);
     if (key.startsWith("bearer:")) return path.join(dir, `${accountOf(key, "bearer")}.token`);
     throw new Error(`Unknown secret key "${key}"`);
@@ -81,7 +88,7 @@ export const fileStore = ({ dir, clientPath }: FileStoreOptions): SecretStore =>
     },
     keys: () => {
       const keys: string[] = [];
-      if (existsSync(clientPath)) keys.push(CLIENT);
+      if (existsSync(clientPath)) keys.push(CLIENT_KEY);
       let files: string[] = [];
       try {
         files = readdirSync(dir);
@@ -104,7 +111,7 @@ export interface NativeEntry {
   deletePassword(): boolean;
 }
 
-/** The subset of `@napi-rs/keyring` this module uses. */
+/** The subset of `@napi-rs/keyring` this module uses. Kept structural so tests can fake it. */
 export interface NativeKeyring {
   Entry: new (service: string, account: string, options?: unknown) => NativeEntry;
   findCredentials(service: string): { account: string; password: string }[];
@@ -114,13 +121,17 @@ export interface NativeKeyring {
 // which would lose every credential on reboot.
 const LINUX_SECRET_SERVICE = { linux: { store: "secret-service" } } as const;
 
-export const keyringStore = (native: NativeKeyring, platform: NodeJS.Platform = process.platform): SecretStore => {
-  const entry = (key: string): NativeEntry => new native.Entry(SERVICE, key, LINUX_SECRET_SERVICE);
+export const keyringStore = (
+  native: NativeKeyring,
+  platform: NodeJS.Platform = process.platform,
+  service: string = SERVICE
+): SecretStore => {
+  const entry = (key: string): NativeEntry => new native.Entry(service, key, LINUX_SECRET_SERVICE);
   return {
     kind: "keyring",
     get: (key) => entry(key).getPassword() ?? undefined,
     set: (key, value) => {
-      const bytes = Buffer.byteLength(value, "utf8");
+      const bytes = value.length * 2; // stored as UTF-16, so 2 bytes per code unit
       if (platform === "win32" && bytes > WIN32_MAX_BLOB_BYTES) {
         throw new Error(
           `Secret "${key}" is ${bytes} bytes, over the Windows credential store limit of ${WIN32_MAX_BLOB_BYTES} bytes`
@@ -129,7 +140,7 @@ export const keyringStore = (native: NativeKeyring, platform: NodeJS.Platform = 
       entry(key).setPassword(value);
     },
     delete: (key) => entry(key).deletePassword(),
-    keys: () => native.findCredentials(SERVICE).map((c) => c.account),
+    keys: () => native.findCredentials(service).map((c) => c.account),
     describe: () => "the system keyring",
   };
 };
@@ -161,6 +172,8 @@ export interface ResolveStoreOptions {
 const importNative = async (): Promise<NativeKeyring> =>
   (await import("@napi-rs/keyring")) as unknown as NativeKeyring;
 
+const MODES = ["auto", "file", "keyring", "memory"] as const;
+
 /**
  * Picks the backend from `GMAIL_MCP_KEYRING`:
  * `file` / `memory` force a store; `auto` (default) prefers the OS keyring and falls back
@@ -174,14 +187,25 @@ export const resolveStore = async ({
   warn = (msg) => console.error(msg),
   importKeyring = importNative,
 }: ResolveStoreOptions): Promise<SecretStore> => {
-  const mode = (env.GMAIL_MCP_KEYRING || "auto").toLowerCase();
+  const configured = env.GMAIL_MCP_KEYRING;
+  const mode = (configured ?? "auto").trim().toLowerCase() || "auto";
+  if (!(MODES as readonly string[]).includes(mode)) {
+    throw new Error(
+      `Unknown GMAIL_MCP_KEYRING value "${configured}". Expected one of: ${MODES.join(", ")}.`
+    );
+  }
   if (mode === "file") return fileStore({ dir, clientPath });
-  if (mode === "memory") return memoryStore();
+  if (mode === "memory") {
+    warn("gmail-mcp: GMAIL_MCP_KEYRING=memory keeps secrets only in this process (not persisted).");
+    return memoryStore();
+  }
 
   try {
     const native = await importKeyring();
-    // Entries are created lazily; probing the service is what proves a store is reachable.
-    native.findCredentials(SERVICE);
+    // Probe the same pinned entry construction that real reads/writes use. A bare
+    // findCredentials would silently succeed via the kernel keyring on Linux even when
+    // Secret Service (which the entries require) is unavailable.
+    new native.Entry(SERVICE, PROBE_KEY, LINUX_SECRET_SERVICE).getPassword();
     return keyringStore(native, platform);
   } catch (err) {
     const message = (err as Error)?.message ?? String(err);

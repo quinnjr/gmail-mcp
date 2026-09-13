@@ -49,7 +49,7 @@ The file must be an installed-app OAuth client:
 
 Override the location with `GMAIL_MCP_CREDENTIALS`.
 
-On first run the server imports this file into the OS keyring and **deletes it** (the keyring becomes the single source of truth). Because the default location is shared with `google-mcp`, that deletion also removes `google-mcp`'s copy — point `GMAIL_MCP_CREDENTIALS` at a gmail-mcp-only file first if `google-mcp` still needs it.
+On first run, when a keyring is active, the server imports this file into the OS keyring and **deletes it** (the keyring becomes the single source of truth). Because the default location is shared with `google-mcp`, that deletion also removes `google-mcp`'s copy — point `GMAIL_MCP_CREDENTIALS` at a gmail-mcp-only file first if `google-mcp` still needs it. The file fallback never deletes it.
 
 ### Scopes
 

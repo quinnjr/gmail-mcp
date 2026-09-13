@@ -359,24 +359,79 @@ describe("account store over the keyring", () => {
     await expect(readFile(path.join(dir, "accounts"), "utf8")).rejects.toThrow(/ENOENT/);
   });
 
-  it("imports account files and the OAuth client into the store, deleting the plaintext", async () => {
+  it("removes an account and its token", async () => {
+    const a = await freshAuthMemory(await tmp());
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    await a.writeAccountToken("amy@example.com", "t");
+    await a.removeAccount("amy@example.com");
+    expect(await a.listAccounts()).toEqual([]);
+    expect(await a.readAccountToken("amy@example.com")).toBeUndefined();
+    expect(await a.readAccountTokens("amy@example.com")).toBeUndefined();
+    await expect(a.removeAccount("nobody@example.com")).rejects.toThrow(/Unknown account/);
+  });
+});
+
+/** A durable-looking target store for migration tests, backed by a Map. */
+const fakeKeyring = (map = new Map<string, string>()) => ({
+  kind: "keyring" as const,
+  get: (k: string) => map.get(k),
+  set: (k: string, v: string) => void map.set(k, v),
+  delete: (k: string) => map.delete(k),
+  keys: () => [...map.keys()],
+  describe: () => "the system keyring",
+  map,
+});
+
+describe("migrateFilesToStore", () => {
+  it("imports account files and the OAuth client into a keyring, deleting the plaintext", async () => {
     const dir = await tmp();
     const accounts = path.join(dir, "accounts");
     await mkdir(accounts, { recursive: true });
     await writeFile(path.join(accounts, "amy@example.com.json"), JSON.stringify({ refresh_token: "a" }));
     await writeFile(path.join(accounts, "amy@example.com.token"), "tok");
     await writeCredentials(dir);
-    const a = await freshAuthMemory(dir);
+    const { migrateFilesToStore } = await freshAuth(dir);
+    const store = fakeKeyring();
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      expect(await a.listAccounts()).toEqual(["amy@example.com"]);
-      expect(await a.readAccountToken("amy@example.com")).toBe("tok");
-      expect(JSON.parse((await a.readClientCredentials())!)).toEqual({
-        installed: { client_id: "id", client_secret: "secret" },
-      });
+      await migrateFilesToStore(store);
+      expect(store.get("oauth:amy@example.com")).toBe(JSON.stringify({ refresh_token: "a" }));
+      expect(store.get("bearer:amy@example.com")).toBe("tok");
+      expect(store.get("client")).toBe(JSON.stringify({ installed: { client_id: "id", client_secret: "secret" } }));
       await expect(readFile(path.join(accounts, "amy@example.com.json"), "utf8")).rejects.toThrow(/ENOENT/);
       await expect(readFile(path.join(accounts, "amy@example.com.token"), "utf8")).rejects.toThrow(/ENOENT/);
       await expect(readFile(path.join(dir, "credentials.json"), "utf8")).rejects.toThrow(/ENOENT/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not run for the memory backend, leaving files in place", async () => {
+    const dir = await tmp();
+    const accounts = path.join(dir, "accounts");
+    await mkdir(accounts, { recursive: true });
+    await writeFile(path.join(accounts, "amy@example.com.token"), "tok");
+    const a = await freshAuthMemory(dir);
+    expect(await a.listAccounts()).toEqual([]);
+    expect(await readFile(path.join(accounts, "amy@example.com.token"), "utf8")).toBe("tok");
+  });
+
+  it("leaves a file on disk when the destination write fails", async () => {
+    const dir = await tmp();
+    const accounts = path.join(dir, "accounts");
+    await mkdir(accounts, { recursive: true });
+    await writeFile(path.join(accounts, "amy@example.com.token"), "tok");
+    const { migrateFilesToStore } = await freshAuth(dir);
+    const failing = {
+      ...fakeKeyring(),
+      set: () => {
+        throw new Error("keyring locked");
+      },
+    };
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await migrateFilesToStore(failing);
+      expect(await readFile(path.join(accounts, "amy@example.com.token"), "utf8")).toBe("tok");
     } finally {
       spy.mockRestore();
     }
@@ -411,5 +466,24 @@ describe("cachedTokenReader", () => {
     expect(await reader("amy@example.com")).toBe("t-1");
     await a.writeAccountToken("amy@example.com", "t-2");
     expect(await reader("amy@example.com")).toBe("t-2");
+  });
+
+  it("falls back to the default TTL when the env value is not a finite number", async () => {
+    const a = await freshAuthMemory(await tmp());
+    await a.writeAccountToken("amy@example.com", "t-1");
+    vi.stubEnv("GMAIL_MCP_TOKEN_CACHE_MS", "banana");
+    const reader = a.cachedTokenReader();
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      expect(await reader("amy@example.com")).toBe("t-1");
+      await a.writeAccountToken("amy@example.com", "t-2");
+      expect(await reader("amy@example.com")).toBe("t-1"); // default 5000ms, still cached
+      vi.setSystemTime(5001);
+      expect(await reader("amy@example.com")).toBe("t-2");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

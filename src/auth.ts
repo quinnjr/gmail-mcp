@@ -5,7 +5,7 @@ import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { google, type Auth, type gmail_v1 } from "googleapis";
-import { resolveStore, type SecretStore } from "./secret-store.js";
+import { assertValidAccount, CLIENT_KEY, fileStore, resolveStore, type SecretStore } from "./secret-store.js";
 
 const configDir = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 const dataDir = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
@@ -24,18 +24,15 @@ export const ACCOUNTS_DIR =
   process.env.GMAIL_MCP_ACCOUNTS_DIR || path.join(dataDir, "gmail-mcp", "accounts");
 export const normalizeEmail = (email: string): string => {
   const v = email.trim().toLowerCase();
-  if (v.includes("/") || v.includes("\\") || v.includes("..")) {
-    throw new Error(`Invalid account "${email}"`);
-  }
+  assertValidAccount(v);
   return v;
 };
 
-/** Path helpers for the file fallback (and migration source). Ignored by the keyring. */
+/** Path helpers describing the file-fallback layout; used by tests and migration. */
 export const accountPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalizeEmail(email)}.json`);
 export const tokenPath = (email: string): string => path.join(ACCOUNTS_DIR, `${normalizeEmail(email)}.token`);
 
 /** Key names within whichever store is active. */
-export const CLIENT_KEY = "client";
 export const oauthKey = (email: string): string => `oauth:${normalizeEmail(email)}`;
 export const bearerKey = (email: string): string => `bearer:${normalizeEmail(email)}`;
 
@@ -47,52 +44,39 @@ export const unknownAccountError = (email: string, known: string[]): Error =>
 let storePromise: Promise<SecretStore> | undefined;
 let migration: Promise<void> | undefined;
 
-/** The active secret store. Memoized; a fresh import (tests) re-resolves it. */
-export const getStore = (): Promise<SecretStore> =>
+const getStore = (): Promise<SecretStore> =>
   (storePromise ??= resolveStore({ dir: ACCOUNTS_DIR, clientPath: CREDENTIALS_PATH }));
 
-/** Best-effort one-time import of the plaintext layout into the keyring. */
-const migrateFilesToStore = async (store: SecretStore): Promise<void> => {
-  if (store.kind === "file") return;
+/** Canonicalizes a file-store key so a mixed-case file lands under the same key lookups use. */
+const canonicalKey = (key: string): string => {
+  if (key.startsWith("oauth:")) return oauthKey(key.slice("oauth:".length));
+  if (key.startsWith("bearer:")) return bearerKey(key.slice("bearer:".length));
+  return key;
+};
 
-  let files: string[] = [];
-  try {
-    files = await fs.readdir(ACCOUNTS_DIR);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error("gmail-mcp: could not scan the accounts directory for migration:", err);
-      return;
-    }
-  }
-  for (const file of files) {
-    const isJson = file.endsWith(".json");
-    const isToken = file.endsWith(".token");
-    if (!isJson && !isToken) continue;
-    const email = file.slice(0, isJson ? -".json".length : -".token".length);
-    const key = isJson ? `oauth:${email}` : `bearer:${email}`;
+/**
+ * One-time import of the plaintext layout into the keyring, then delete what moved.
+ * Exported as a seam for tests; production always reaches it via `readyStore`.
+ * A file is deleted only after its keyring write succeeds; a failed write is logged and
+ * the file is left in place for `GMAIL_MCP_KEYRING=file`.
+ */
+export const migrateFilesToStore = async (store: SecretStore): Promise<void> => {
+  if (store.kind !== "keyring") return;
+  const source = fileStore({ dir: ACCOUNTS_DIR, clientPath: CREDENTIALS_PATH });
+  for (const key of source.keys()) {
+    const canonical = canonicalKey(key);
     try {
-      const contents = await fs.readFile(path.join(ACCOUNTS_DIR, file), "utf8");
-      store.set(key, contents);
-      await fs.rm(path.join(ACCOUNTS_DIR, file), { force: true });
-      console.error(`gmail-mcp: moved ${email} ${isJson ? "credentials" : "bearer token"} into ${store.describe(key)}`);
+      if (store.get(canonical) === undefined) {
+        const value = source.get(key);
+        if (value === undefined) continue;
+        store.set(canonical, value);
+      }
+      source.delete(key);
+      console.error(`gmail-mcp: moved ${source.describe(key)} into ${store.describe(canonical)}`);
     } catch (err) {
       console.error(
-        `gmail-mcp: could not migrate ${file} into ${store.describe(key)} (${(err as Error).message}); leaving it on disk.`
-      );
-    }
-  }
-
-  try {
-    if (store.get(CLIENT_KEY) === undefined) {
-      const contents = await fs.readFile(CREDENTIALS_PATH, "utf8");
-      store.set(CLIENT_KEY, contents);
-      await fs.rm(CREDENTIALS_PATH, { force: true });
-      console.error(`gmail-mcp: moved OAuth client credentials into ${store.describe(CLIENT_KEY)}`);
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error(
-        `gmail-mcp: could not migrate ${CREDENTIALS_PATH} into the keyring (${(err as Error).message}); leaving it on disk.`
+        `gmail-mcp: could not migrate ${source.describe(key)} into the keyring (${(err as Error).message}); ` +
+          "leaving it on disk. Set GMAIL_MCP_KEYRING=file to keep using it."
       );
     }
   }
@@ -111,7 +95,15 @@ export const saveAccountTokens = async (email: string, tokens: Auth.Credentials)
 
 export const readAccountTokens = async (email: string): Promise<Auth.Credentials | undefined> => {
   const raw = (await readyStore()).get(oauthKey(email));
-  return raw ? (JSON.parse(raw) as Auth.Credentials) : undefined;
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as Auth.Credentials;
+  } catch (err) {
+    throw new Error(
+      `Stored credentials for ${email} are corrupt (${(err as Error).message}). ` +
+        `Run \`gmail-mcp auth\` and sign in as ${email} to replace them.`
+    );
+  }
 };
 
 export const readClientCredentials = async (): Promise<string | undefined> => (await readyStore()).get(CLIENT_KEY);
@@ -144,7 +136,9 @@ export const writeAccountToken = async (email: string, token: string): Promise<v
  * A TTL of 0 reads through on every call.
  */
 export const cachedTokenReader = (ttlMs?: number): ((email: string) => Promise<string | undefined>) => {
-  const ttl = ttlMs ?? Number(process.env.GMAIL_MCP_TOKEN_CACHE_MS ?? 5000);
+  const configured = ttlMs ?? Number(process.env.GMAIL_MCP_TOKEN_CACHE_MS ?? 5000);
+  // A non-numeric or negative override must not silently disable (NaN) or pin (Infinity) the cache.
+  const ttl = Number.isFinite(configured) && configured >= 0 ? configured : 5000;
   const cache = new Map<string, { value: string | undefined; expiresAt: number }>();
   return async (email: string): Promise<string | undefined> => {
     const now = Date.now();
@@ -225,20 +219,21 @@ const resolveEmail = async (
   return normalizeEmail(raw);
 };
 
-const notAnOAuthClient = (raw: string): Error =>
+const notAnOAuthClient = (): Error =>
   new Error(
     `credentials.json is not an OAuth client file: expected {"installed": {"client_id", "client_secret", ...}} ` +
       `as downloaded from Google Cloud Console > Credentials > OAuth client ID (Desktop app). ` +
-      `Provide it at ${CREDENTIALS_PATH} (or import it into the keyring). Saw: ${raw.slice(0, 80)}`
+      `Provide it at ${CREDENTIALS_PATH} (or import it into the keyring).`
   );
 
 /**
  * Builds an OAuth client from the stored client credentials. When `persist` is given,
- * refreshed access tokens are handed to it (the caller decides where they land).
+ * refreshed access tokens are handed to it (the caller decides where they land). The
+ * callback may be async; its rejection is logged so a refresh is never silently lost.
  */
 export const createClient = async (
   redirectUri?: string,
-  persist?: (creds: Auth.Credentials) => void
+  persist?: (creds: Auth.Credentials) => void | Promise<void>
 ): Promise<Auth.OAuth2Client> => {
   const raw = await readClientCredentials();
   if (!raw) {
@@ -247,25 +242,30 @@ export const createClient = async (
         "downloaded from Google Cloud Console > Credentials > OAuth client ID (Desktop app)."
     );
   }
-  let parsed: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
-  } catch (err) {
-    throw notAnOAuthClient(raw);
+    parsed = JSON.parse(raw);
+  } catch {
+    throw notAnOAuthClient();
   }
-  const app = (parsed.installed ?? parsed.web) as { client_id?: string; client_secret?: string } | undefined;
-  if (!app?.client_id || !app.client_secret) throw notAnOAuthClient(raw);
+  if (parsed === null || typeof parsed !== "object") throw notAnOAuthClient();
+  const app = ((parsed as Record<string, unknown>).installed ?? (parsed as Record<string, unknown>).web) as
+    | { client_id?: string; client_secret?: string }
+    | undefined;
+  if (!app?.client_id || !app.client_secret) throw notAnOAuthClient();
   const client = new google.auth.OAuth2(app.client_id, app.client_secret, redirectUri);
   if (persist) {
     // Refreshes emit only the new access token; keep the refresh token alongside it.
     client.on("tokens", (t) => {
-      try {
-        persist({ ...client.credentials, ...t });
-      } catch (err) {
+      const report = (err: unknown): void =>
         console.error(
           `gmail-mcp: could not persist refreshed tokens (${err}). ` +
             "This process keeps working; if auth fails after a restart, run `gmail-mcp auth`."
         );
+      try {
+        Promise.resolve(persist({ ...client.credentials, ...t })).catch(report);
+      } catch (err) {
+        report(err);
       }
     });
   }
@@ -348,14 +348,7 @@ export const loadAccounts = async ({
   const accounts = new Map<string, LoadedAccount>();
   for (const email of emails) {
     try {
-      const client = await createClient(undefined, (creds) => {
-        saveAccountTokens(email, creds).catch((err) =>
-          console.error(
-            `gmail-mcp: could not persist refreshed tokens for ${email} (${err}). ` +
-              "This process keeps working; if auth fails after a restart, run `gmail-mcp auth`."
-          )
-        );
-      });
+      const client = await createClient(undefined, (creds) => saveAccountTokens(email, creds));
       client.setCredentials((await readAccountTokens(email)) ?? {});
       const token = await ensureToken(email, (location) =>
         console.error(`gmail-mcp: generated a bearer token for ${email} in ${location}; print it with \`gmail-mcp token ${email}\``)
@@ -433,8 +426,16 @@ export const authorize = async ({
       (msg) => `Signed in, but could not determine the account email (${msg}). Retry \`gmail-mcp auth\`.`,
       profileTimeoutMs
     );
-    await saveAccountTokens(email, tokens);
-    const token = await ensureToken(email);
+    let token: string;
+    try {
+      await saveAccountTokens(email, tokens);
+      token = await ensureToken(email);
+    } catch (err) {
+      throw new Error(
+        `Signed in as ${email}, but could not store its credentials (${(err as Error).message}). ` +
+          "Unlock the system keyring, or set GMAIL_MCP_KEYRING=file, then retry `gmail-mcp auth`."
+      );
+    }
     const store = await readyStore();
     console.error(
       `Signed in as ${email}; credentials in ${store.describe(oauthKey(email))}, bearer token in ${store.describe(bearerKey(email))}.\n` +

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -128,16 +128,18 @@ describe("cli", () => {
     await expect(cli(["auth"])).rejects.toThrow(/No OAuth client credentials/);
   });
 
-  it("accounts: imports plaintext account files into the keyring on first use", async () => {
+  it("accounts: in memory mode does not migrate or delete plaintext files", async () => {
     const dir = await tmp();
     const accounts = path.join(dir, "accounts");
     await mkdir(accounts, { recursive: true });
-    await writeFile(path.join(accounts, "amy@example.com.json"), JSON.stringify({ refresh_token: "a" }));
+    const contents = JSON.stringify({ refresh_token: "a" });
+    await writeFile(path.join(accounts, "amy@example.com.json"), contents);
     const { cli, listAccounts } = await freshCliMemory(dir);
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await expect(cli(["accounts"])).resolves.toBe(true);
-      expect(await listAccounts()).toEqual(["amy@example.com"]);
+      expect(await listAccounts()).toEqual([]);
+      expect(await readFile(path.join(accounts, "amy@example.com.json"), "utf8")).toBe(contents);
     } finally {
       spy.mockRestore();
     }

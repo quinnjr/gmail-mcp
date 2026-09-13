@@ -16,13 +16,15 @@ const tmp = () => mkdtemp(path.join(os.tmpdir(), "gmail-mcp-store-"));
 interface FakeNative extends NativeKeyring {
   store: Map<string, Map<string, string>>;
   lastOptions: unknown;
+  failGet?: boolean;
 }
 
-const fakeNative = (): FakeNative => {
+const fakeNative = (failGet = false): FakeNative => {
   const store = new Map<string, Map<string, string>>();
   const self = {
     store,
     lastOptions: undefined as unknown,
+    failGet,
     Entry: class {
       constructor(
         readonly service: string,
@@ -32,6 +34,7 @@ const fakeNative = (): FakeNative => {
         self.lastOptions = options;
       }
       getPassword(): string | null {
+        if (self.failGet) throw new Error("keyring locked");
         return store.get(this.service)?.get(this.account) ?? null;
       }
       setPassword(password: string): void {
@@ -116,10 +119,18 @@ describe("keyringStore", () => {
     expect(native.lastOptions).toEqual({ linux: { store: "secret-service" } });
   });
 
-  it("refuses a value over the Windows credential blob cap", () => {
+  it("uses a custom service when given one", () => {
+    const native = fakeNative();
+    const s = keyringStore(native, "linux", "gmail-mcp-test");
+    s.set("bearer:amy@example.com", "tok");
+    expect(native.store.has("gmail-mcp-test")).toBe(true);
+    expect(s.keys()).toEqual(["bearer:amy@example.com"]);
+  });
+
+  it("refuses a value over the Windows UTF-16 credential blob cap", () => {
     const s = keyringStore(fakeNative(), "win32");
-    expect(() => s.set("oauth:amy@example.com", "x".repeat(2561))).toThrow(/2560/);
-    expect(() => s.set("oauth:amy@example.com", "x".repeat(2560))).not.toThrow();
+    expect(() => s.set("oauth:amy@example.com", "x".repeat(1281))).toThrow(/2560/);
+    expect(() => s.set("oauth:amy@example.com", "x".repeat(1280))).not.toThrow();
   });
 });
 
@@ -140,10 +151,18 @@ describe("resolveStore", () => {
 
   it("honours GMAIL_MCP_KEYRING=file and =memory", async () => {
     expect((await resolveStore({ ...base, env: { GMAIL_MCP_KEYRING: "file" } })).kind).toBe("file");
-    expect((await resolveStore({ ...base, env: { GMAIL_MCP_KEYRING: "memory" } })).kind).toBe("memory");
+    const warn = vi.fn();
+    expect((await resolveStore({ ...base, env: { GMAIL_MCP_KEYRING: "memory" }, warn })).kind).toBe("memory");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("not persisted"));
   });
 
-  it("auto falls back to files and warns when the keyring is unavailable", async () => {
+  it("rejects an unknown GMAIL_MCP_KEYRING value instead of quietly falling back", async () => {
+    await expect(resolveStore({ ...base, env: { GMAIL_MCP_KEYRING: "keyringg" } })).rejects.toThrow(
+      /Unknown GMAIL_MCP_KEYRING value "keyringg"/
+    );
+  });
+
+  it("auto falls back to files and warns when the module cannot load", async () => {
     const warn = vi.fn();
     const s = await resolveStore({
       ...base,
@@ -155,6 +174,13 @@ describe("resolveStore", () => {
     });
     expect(s.kind).toBe("file");
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("no service"));
+  });
+
+  it("auto falls back to files when the pinned probe fails", async () => {
+    const warn = vi.fn();
+    const s = await resolveStore({ ...base, env: {}, warn, importKeyring: async () => fakeNative(true) });
+    expect(s.kind).toBe("file");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("keyring locked"));
   });
 
   it("auto uses the keyring when the import and probe succeed", async () => {
@@ -175,21 +201,23 @@ describe("resolveStore", () => {
   });
 });
 
-describe("keyringStore against the real Secret Service", () => {
-  const available = async (): Promise<boolean> => {
-    try {
-      const native = (await import("@napi-rs/keyring")) as unknown as NativeKeyring;
-      native.findCredentials(SERVICE);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  it("stores, lists, and deletes a probe entry when a store is present", async () => {
-    if (!(await available())) return;
+// Deliberately isolated: a per-process service name so a developer's real gmail-mcp
+// entries are never touched, and skipIf so a host without a store reports "skipped".
+const keyringAvailable = await (async (): Promise<boolean> => {
+  try {
     const native = (await import("@napi-rs/keyring")) as unknown as NativeKeyring;
-    const s = keyringStore(native, process.platform);
+    new native.Entry("gmail-mcp-selftest", "probe").getPassword();
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+describe.skipIf(!keyringAvailable)("keyringStore against the real OS store", () => {
+  it("stores, lists, and deletes a probe entry", async () => {
+    const native = (await import("@napi-rs/keyring")) as unknown as NativeKeyring;
+    const service = `gmail-mcp-test-${process.pid}`;
+    const s = keyringStore(native, process.platform, service);
     const key = "probe:secret-store-test";
     try {
       s.set(key, "probe-value");
@@ -198,5 +226,6 @@ describe("keyringStore against the real Secret Service", () => {
     } finally {
       s.delete(key);
     }
+    expect(s.keys()).not.toContain(key);
   });
 });
