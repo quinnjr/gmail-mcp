@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,8 +10,14 @@ const freshCli = async (dir: string) => {
   vi.resetModules();
   vi.stubEnv("GMAIL_MCP_ACCOUNTS_DIR", path.join(dir, "accounts"));
   vi.stubEnv("GMAIL_MCP_CREDENTIALS", path.join(dir, "credentials.json"));
+  vi.stubEnv("GMAIL_MCP_KEYRING", "file");
   const [index, auth] = await Promise.all([import("./index.js"), import("./auth.js")]);
   return { ...index, ...auth };
+};
+const freshCliMemory = async (dir: string) => {
+  const cli = await freshCli(dir);
+  vi.stubEnv("GMAIL_MCP_KEYRING", "memory");
+  return cli;
 };
 
 afterEach(() => vi.unstubAllEnvs());
@@ -119,7 +125,24 @@ describe("cli", () => {
   it("auth: with no flag, runs authorize() and propagates its failure", async () => {
     const dir = await tmp();
     const { cli } = await freshCli(dir);
-    await expect(cli(["auth"])).rejects.toThrow(/ENOENT|no such file/);
+    await expect(cli(["auth"])).rejects.toThrow(/No OAuth client credentials/);
+  });
+
+  it("accounts: in memory mode does not migrate or delete plaintext files", async () => {
+    const dir = await tmp();
+    const accounts = path.join(dir, "accounts");
+    await mkdir(accounts, { recursive: true });
+    const contents = JSON.stringify({ refresh_token: "a" });
+    await writeFile(path.join(accounts, "amy@example.com.json"), contents);
+    const { cli, listAccounts } = await freshCliMemory(dir);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(cli(["accounts"])).resolves.toBe(true);
+      expect(await listAccounts()).toEqual([]);
+      expect(await readFile(path.join(accounts, "amy@example.com.json"), "utf8")).toBe(contents);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("returns false for anything else, leaving it to the caller", async () => {

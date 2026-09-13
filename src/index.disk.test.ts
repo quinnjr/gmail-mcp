@@ -10,6 +10,7 @@ import type { gmail_v1 } from "googleapis";
 const freshIndex = async (dir: string) => {
   vi.resetModules();
   vi.stubEnv("GMAIL_MCP_ACCOUNTS_DIR", path.join(dir, "accounts"));
+  vi.stubEnv("GMAIL_MCP_KEYRING", "file");
   const [index, auth] = await Promise.all([import("./index.js"), import("./auth.js")]);
   return { ...index, ...auth };
 };

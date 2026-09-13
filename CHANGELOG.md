@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 — 2026-09-13
+
+### Added
+
+- Credentials in the OS keyring. The OAuth client, per-account OAuth tokens, and per-account bearer tokens are stored via `@napi-rs/keyring` — Secret Service on Linux, Keychain on macOS, Credential Manager on Windows — under one `gmail-mcp` service (`client`, `oauth:<email>`, `bearer:<email>`). On Linux entries are pinned to the Secret Service; the RAM-only kernel keyring is never used.
+- `GMAIL_MCP_KEYRING`: `auto` (default) prefers the keyring and falls back to `0600` files with a stderr warning, `file` forces the old layout, `keyring` fails closed if no store is available, `memory` is test-only.
+- `GMAIL_MCP_TOKEN_CACHE_MS` (default `5000`) bounds how long a bearer token is cached in memory before the keyring is re-read.
+- Automatic migration: on first use, `credentials.json`, `ACCOUNTS_DIR/<email>.json`, and `<email>.token` are imported into the keyring and deleted. A file is only removed after its keyring write succeeds, and migration only runs when a keyring is active (the file fallback leaves files in place).
+
+### Changed
+
+- Bearer tokens are cached for `GMAIL_MCP_TOKEN_CACHE_MS`, so `gmail-mcp token <email> --rotate` takes effect within that window instead of on the very next request. Set it to `0` for read-through behavior. `cachedTokenReader(ttlMs?)` accepts a per-reader override; an unset or non-numeric value falls back to the default.
+- Adding `@napi-rs/keyring` introduces a native (prebuilt) dependency; on Linux a Secret Service must be running for keyring storage.
+
+### Breaking
+
+For library consumers:
+
+- `createClient(redirectUri?, tokenFile?)` now takes `createClient(redirectUri?, persist?)`, a callback receiving refreshed credentials, instead of a token-file path.
+- `TOKEN_PATH` / `ACCOUNTS_DIR` are now the file-fallback layout and migration source; the store is selected by `GMAIL_MCP_KEYRING`.
+
 ## 0.2.0 — 2026-09-08
 
 ### Added
