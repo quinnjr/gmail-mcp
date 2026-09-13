@@ -9,6 +9,7 @@ Unlike the broader [`google-mcp`](https://github.com/quinnjr/google-mcp) server,
 - **Complete Gmail v1 coverage** — 81 tools spanning `users.messages`, `threads`, `drafts`, `labels`, `history`, and the entire `users.settings.*` tree (send-as, forwarding addresses, auto-forwarding, vacation responder, IMAP/POP, language, delegates, S/MIME, and CSE identities/keypairs).
 - **Multiple accounts, one worker** — sign in any number of Gmail accounts. A request acts as whichever account its bearer token belongs to; it can only touch that account's mailbox.
 - **Bearer authentication** — every `/mcp` request must carry `Authorization: Bearer <token>`. Each account has its own token, stored separately from its OAuth credentials.
+- **Secrets in the OS keyring** — the OAuth client, per-account OAuth tokens, and bearer tokens live in the system credential store: Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. If no store is available the server falls back to `0600` files with a warning.
 - **Streamable HTTP transport** — the current MCP transport at `/mcp`, one MCP session per client, with DNS-rebinding protection.
 - **Seeds from google-mcp** — reuses `google-mcp`'s OAuth client and refresh token on first run, so a common setup needs no separate browser consent (tools outside the seeded scopes 403 until you run `gmail-mcp auth`).
 
@@ -20,7 +21,7 @@ pnpm install
 pnpm build
 ```
 
-Requires Node.js >= 20.19.0 and pnpm.
+Requires Node.js >= 20.19.0 and pnpm. The keyring integration ships prebuilt binaries via `@napi-rs/keyring`; on Linux it uses the Secret Service (gnome-keyring, KWallet, or KeePassXC). Without a store, the server falls back to files (see [Security model](#security-model)).
 
 ## Google Cloud setup
 
@@ -47,6 +48,8 @@ The file must be an installed-app OAuth client:
 ```
 
 Override the location with `GMAIL_MCP_CREDENTIALS`.
+
+On first run the server imports this file into the OS keyring and **deletes it** (the keyring becomes the single source of truth). Because the default location is shared with `google-mcp`, that deletion also removes `google-mcp`'s copy — point `GMAIL_MCP_CREDENTIALS` at a gmail-mcp-only file first if `google-mcp` still needs it.
 
 ### Scopes
 
@@ -79,7 +82,7 @@ gmail-mcp token <email> --rotate   # replace the token (existing clients must up
 gmail-mcp auth --remove <email>    # remove an account and its token
 ```
 
-Tokens are read from disk on every request, so a rotation takes effect on the next call. **Adding a new account requires a server restart.**
+Tokens are cached in memory for `GMAIL_MCP_TOKEN_CACHE_MS` (default `5000` ms), so a rotation takes effect within that window rather than necessarily on the very next call. **Adding a new account requires a server restart.**
 
 ## Running the server
 
@@ -95,10 +98,12 @@ It listens on `http://127.0.0.1:3016/mcp` by default. Override with:
 |---|---|---|
 | `GMAIL_MCP_HOST` | `127.0.0.1` | Bind host |
 | `GMAIL_MCP_PORT` / `PORT` | `3016` | Bind port |
-| `GMAIL_MCP_CREDENTIALS` | `~/.config/google-mcp/credentials.json` | OAuth client file |
+| `GMAIL_MCP_CREDENTIALS` | `~/.config/google-mcp/credentials.json` | OAuth client file (imported into the keyring, then deleted, on first run) |
+| `GMAIL_MCP_KEYRING` | `auto` | `auto` prefers the OS keyring, falling back to files with a warning; `file` forces `0600` files; `keyring` fails closed if unavailable; `memory` is test-only |
+| `GMAIL_MCP_TOKEN_CACHE_MS` | `5000` | Bearer-token cache TTL in ms; `0` reads through on every request |
 | `GMAIL_MCP_TOKENS` | `~/.local/share/gmail-mcp/tokens.json` | Legacy single-account token (migrated on first run) |
 | `GMAIL_MCP_SEED_TOKENS` | `~/.local/share/google-mcp/tokens.json` | google-mcp refresh token to seed from |
-| `GMAIL_MCP_ACCOUNTS_DIR` | `~/.local/share/gmail-mcp/accounts` | Per-account store (`<email>.json` credentials, `<email>.token` bearer tokens) |
+| `GMAIL_MCP_ACCOUNTS_DIR` | `~/.local/share/gmail-mcp/accounts` | File-fallback store (`<email>.json` credentials, `<email>.token` bearer tokens); also the migration source |
 
 Paths honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` when set.
 
@@ -127,7 +132,7 @@ Every tool accepts an optional `account` argument. It exists for compatibility a
 
 - **Token binds to one account.** A session is opened by a token; only that token, for that account, can use the session. A session id belonging to another account — or one whose token has since rotated — returns the same `404` as an unknown session, so a probe can't distinguish live sessions from dead ones. Missing/unknown tokens get `401`.
 - **Constant-time comparison.** Bearer tokens are compared by SHA-256 digest with `timingSafeEqual`, hiding both value and length.
-- **Secrets on disk are locked down.** The accounts directory and token/credential files are written `0700`/`0600`, with permissions repaired on every write.
+- **Secrets in the OS keyring.** The OAuth client, each account's OAuth tokens, and each bearer token are stored in Secret Service (Linux), Keychain (macOS), or Credential Manager (Windows). Existing `credentials.json`, `<email>.json`, and `<email>.token` files are imported and deleted on first run. When no credential store is available the server falls back to `0700`/`0600` files with a stderr warning; set `GMAIL_MCP_KEYRING=keyring` to fail closed instead. (On Windows the fallback relies on the user-profile ACL, not POSIX mode bits.)
 - **DNS-rebinding protection** is on; only `127.0.0.1`, `localhost`, and the configured host (with and without port) are accepted as `Host`.
 
 ## Available tools

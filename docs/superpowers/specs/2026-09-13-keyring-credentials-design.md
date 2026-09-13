@@ -90,7 +90,7 @@ promise. Every auth function awaits it.
 | Windows | Credential Manager (generic credential) | Generic-credential blobs are capped at 2560 bytes; see below. |
 | Any, unavailable | `fileStore` + warning | On Windows the warning states the file relies on the user-profile ACL, not POSIX mode bits. |
 
-**Windows blob cap.** `keyringStore.set` checks `value.length` (UTF-16 units)
+**Windows blob cap.** `keyringStore.set` checks the UTF-8 byte length of the value
 against 2560 on `win32` and throws a message naming the key and the cap rather
 than letting `CredWrite` fail opaquely. In practice `Auth.Credentials` JSON is
 well under the cap; a value that exceeds it leaves that account unreadable from
@@ -107,8 +107,8 @@ truncated secret. (The file fallback path is unaffected.)
 - `listAccounts` → `keys()` filtered to `oauth:`, sorted
 - new `readClientCredentials()` → `get("client")`
 
-`accountPath` / `tokenPath` stop being exported; the file store keeps its
-`<email>.json` / `<email>.token` mapping internally.
+`accountPath` / `tokenPath` stay exported as helpers describing the file-fallback
+layout; the keyring does not use them.
 
 `createClient(redirectUri?, persist?)` takes a `(creds: Auth.Credentials) => void`
 callback instead of a token-file path. `loadAccounts` passes a callback that
