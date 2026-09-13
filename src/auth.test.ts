@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +11,14 @@ const freshAuth = async (dir: string) => {
   vi.stubEnv("GMAIL_MCP_CREDENTIALS", path.join(dir, "credentials.json"));
   vi.stubEnv("GMAIL_MCP_TOKENS", path.join(dir, "tokens.json"));
   vi.stubEnv("GMAIL_MCP_ACCOUNTS_DIR", path.join(dir, "accounts"));
+  vi.stubEnv("GMAIL_MCP_KEYRING", "file");
   return import("./auth.js");
+};
+// The in-memory store exercises the keyring code path (including migration) without an OS store.
+const freshAuthMemory = async (dir: string) => {
+  const auth = await freshAuth(dir);
+  vi.stubEnv("GMAIL_MCP_KEYRING", "memory");
+  return auth;
 };
 const writeCredentials = (dir: string) =>
   writeFile(path.join(dir, "credentials.json"), JSON.stringify({ installed: { client_id: "id", client_secret: "secret" } }));
@@ -132,17 +139,21 @@ describe("createClient", () => {
     await expect(createClient()).rejects.toThrow(/credentials\.json is not an OAuth client file.*client_id/);
   });
 
-  it("persists refreshed tokens to the given file, merged with the existing refresh token", async () => {
+  it("hands refreshed tokens to the persist callback, merged with the existing refresh token", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
     const { createClient } = await freshAuth(dir);
-    const file = path.join(dir, "accounts", "amy@example.com.json");
-    const c = await createClient(undefined, file);
+    const persisted: unknown[] = [];
+    const c = await createClient(undefined, (creds) => void persisted.push(creds));
     c.setCredentials({ refresh_token: "keep-me", access_token: "old" });
     c.emit("tokens", { access_token: "new", expiry_date: 123 });
-    await vi.waitFor(async () =>
-      expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ refresh_token: "keep-me", access_token: "new", expiry_date: 123 })
-    );
+    expect(persisted).toEqual([{ refresh_token: "keep-me", access_token: "new", expiry_date: 123 }]);
+  });
+
+  it("names the missing file when no OAuth client credentials exist", async () => {
+    const dir = await tmp();
+    const { createClient } = await freshAuth(dir);
+    await expect(createClient()).rejects.toThrow(/No OAuth client credentials.*credentials\.json/);
   });
 });
 
@@ -335,24 +346,70 @@ describe("authorize", () => {
   });
 });
 
-describe("cachedTokenReader", () => {
-  it("reuses the cached token until the file changes, and clears the cache on removal", async () => {
+describe("account store over the keyring", () => {
+  it("round-trips tokens and bearer tokens without touching disk", async () => {
     const dir = await tmp();
-    const a = await freshAuth(dir);
+    const a = await freshAuthMemory(dir);
+    await a.saveAccountTokens("Zed@Example.com", { refresh_token: "z" });
+    await a.saveAccountTokens("amy@example.com", { refresh_token: "a" });
+    expect(await a.listAccounts()).toEqual(["amy@example.com", "zed@example.com"]);
+    expect(await a.readAccountTokens("zed@example.com")).toEqual({ refresh_token: "z" });
+    await a.writeAccountToken("amy@example.com", "t");
+    expect(await a.readAccountToken("amy@example.com")).toBe("t");
+    await expect(readFile(path.join(dir, "accounts"), "utf8")).rejects.toThrow(/ENOENT/);
+  });
+
+  it("imports account files and the OAuth client into the store, deleting the plaintext", async () => {
+    const dir = await tmp();
+    const accounts = path.join(dir, "accounts");
+    await mkdir(accounts, { recursive: true });
+    await writeFile(path.join(accounts, "amy@example.com.json"), JSON.stringify({ refresh_token: "a" }));
+    await writeFile(path.join(accounts, "amy@example.com.token"), "tok");
+    await writeCredentials(dir);
+    const a = await freshAuthMemory(dir);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await a.listAccounts()).toEqual(["amy@example.com"]);
+      expect(await a.readAccountToken("amy@example.com")).toBe("tok");
+      expect(JSON.parse((await a.readClientCredentials())!)).toEqual({
+        installed: { client_id: "id", client_secret: "secret" },
+      });
+      await expect(readFile(path.join(accounts, "amy@example.com.json"), "utf8")).rejects.toThrow(/ENOENT/);
+      await expect(readFile(path.join(accounts, "amy@example.com.token"), "utf8")).rejects.toThrow(/ENOENT/);
+      await expect(readFile(path.join(dir, "credentials.json"), "utf8")).rejects.toThrow(/ENOENT/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("cachedTokenReader", () => {
+  it("reuses the cached token until the TTL expires, then re-reads", async () => {
+    const dir = await tmp();
+    const a = await freshAuthMemory(dir);
     await a.writeAccountToken("amy@example.com", "t-1");
+    const reader = a.cachedTokenReader(1000);
 
-    const reader = a.cachedTokenReader();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      expect(await reader("amy@example.com")).toBe("t-1");
+      await a.writeAccountToken("amy@example.com", "t-2");
+      expect(await reader("amy@example.com")).toBe("t-1"); // still cached
+      vi.setSystemTime(1001);
+      expect(await reader("amy@example.com")).toBe("t-2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
+  it("reads through on every call with ttl 0", async () => {
+    const dir = await tmp();
+    const a = await freshAuthMemory(dir);
+    await a.writeAccountToken("amy@example.com", "t-1");
+    const reader = a.cachedTokenReader(0);
     expect(await reader("amy@example.com")).toBe("t-1");
-    expect(await reader("amy@example.com")).toBe("t-1");
-
-    // Ensure the new write lands with a different mtime/size than the cached stat.
-    await new Promise((r) => setTimeout(r, 10));
-    await a.writeAccountToken("amy@example.com", "t-2-longer");
-    expect(await reader("amy@example.com")).toBe("t-2-longer");
-
-    const { rm } = await import("node:fs/promises");
-    await rm(a.tokenPath("amy@example.com"));
-    expect(await reader("amy@example.com")).toBeUndefined();
+    await a.writeAccountToken("amy@example.com", "t-2");
+    expect(await reader("amy@example.com")).toBe("t-2");
   });
 });
